@@ -1,18 +1,27 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-VERSION="2026-05-12-中文网络管理器"
+VERSION="2026-05-13-中文网络管理器"
 BASE_DIR="/etc/easepi-r2-script"
 CONFIG_FILE="$BASE_DIR/网络配置.env"
 BACKUP_DIR="$BASE_DIR/备份"
 NETWORK_DIR="/etc/systemd/network"
 DNSMASQ_CONF="/etc/dnsmasq.d/easepi-r2-router.conf"
-NFT_CONF="/etc/nftables.conf"
+NFT_MAIN_CONF="/etc/nftables.conf"
+NFT_DIR="/etc/nftables.d"
+NFT_CONF="$NFT_DIR/easepi-r2-nat.nft"
+NFT_TABLE="easepi_r2_nat"
 SYSCTL_CONF="/etc/sysctl.d/99-easepi-r2-router.conf"
 RESOLVED_DIR="/etc/systemd/resolved.conf.d"
 RESOLVED_CONF="$RESOLVED_DIR/easepi-r2-dns.conf"
 HOSTAPD_CONF="/etc/hostapd/hostapd.conf"
+HOSTAPD_DEFAULT="/etc/default/hostapd"
 WPA_DIR="/etc/wpa_supplicant"
+LTE_POLICY_SCRIPT="/usr/local/sbin/easepi-r2-lte4g-policy-route.sh"
+LTE_POLICY_SERVICE="/etc/systemd/system/easepi-r2-lte4g-policy-route.service"
+LTE_POLICY_TIMER="/etc/systemd/system/easepi-r2-lte4g-policy-route.timer"
+LTE_POLICY_TABLE="${LTE_POLICY_TABLE:-1004}"
+LTE_POLICY_PRIO="${LTE_POLICY_PRIO:-1004}"
 
 RED=$'\033[31m'
 GREEN=$'\033[32m'
@@ -60,6 +69,25 @@ quote_sq(){
 cidr_ip(){ echo "${1%/*}"; }
 cidr_prefix(){ [ "$1" = "${1#*/}" ] && echo 24 || echo "${1#*/}"; }
 prefix3(){ echo "$1" | awk -F. '{print $1"."$2"."$3}'; }
+
+wan_has_iface(){
+  local target="$1"
+  echo "$WAN_CONFIG" | awk -F'|' -v i="$target" '$1==i && $2!="disabled"{found=1} END{exit !found}'
+}
+
+remove_wan_iface(){
+  local target="$1"
+  WAN_CONFIG="$(echo "$WAN_CONFIG" | awk -F'|' -v i="$target" 'BEGIN{OFS="|"} $1!="" && $1!=i {print}')"
+}
+
+remove_lan_iface(){
+  local target="$1" word result=""
+  for word in $LAN_IFACES; do
+    [ "$word" = "$target" ] && continue
+    result="${result:+$result }$word"
+  done
+  LAN_IFACES="$result"
+}
 
 prefix_to_mask(){
   local prefix="${1:-24}" out="" full rem i val
@@ -115,7 +143,7 @@ init_defaults(){
   UPSTREAM_DNS="${UPSTREAM_DNS:-$DEVICE_DNS}"
   LAN_DNS="${LAN_DNS:-$LAN_IP}"
   NAT_OUT="${NAT_OUT:-eth0}"
-  LTE4G_METRIC="${LTE4G_METRIC:-900}"
+  LTE4G_METRIC="${LTE4G_METRIC:-30000}"
   WLAN_IFACE="${WLAN_IFACE:-wlan0}"
   WLAN_METRIC="${WLAN_METRIC:-800}"
   WLAN_MODE="${WLAN_MODE:-未配置}"
@@ -236,16 +264,67 @@ probe_mirror(){
   fi
 }
 
+mirror_root(){
+  local url="${1%/}"
+  case "$url" in
+    */ubuntu) echo "${url%/ubuntu}" ;;
+    *) echo "$url" ;;
+  esac
+}
+
+armbian_mirror_url(){
+  local base candidate
+  base="$(mirror_root "$1")"
+  for candidate in "$base/armbian" "$base/armbian/apt"; do
+    if has_cmd curl && [ -n "$OS_CODENAME" ] && curl -fsIL --connect-timeout 3 --max-time 6 "$candidate/dists/$OS_CODENAME/Release" >/dev/null 2>&1; then
+      echo "$candidate"
+      return
+    fi
+  done
+  echo "$base/armbian"
+}
+
+rewrite_armbian_source_file(){
+  local file="$1" armbian_url="$2" tmp
+  grep -qiE 'apt\.armbian\.com|/armbian(/|$)|armbian\.com/apt' "$file" 2>/dev/null || return 1
+  tmp="$(mktemp)"
+  case "$file" in
+    *.sources)
+      awk -v u="$armbian_url" '
+        BEGIN{IGNORECASE=1}
+        { lines[NR]=$0; if ($0 ~ /apt\.armbian\.com|\/armbian(\/|$)|armbian\.com\/apt/) hit=1 }
+        END{
+          for (i=1; i<=NR; i++) {
+            if (hit && lines[i] ~ /^URIs:/) sub(/https?:\/\/[^[:space:]]+/, u, lines[i])
+            print lines[i]
+          }
+        }
+      ' "$file" > "$tmp"
+      ;;
+    *)
+      awk -v u="$armbian_url" '
+        BEGIN{IGNORECASE=1}
+        /^deb[[:space:]]/ && $0 ~ /apt\.armbian\.com|\/armbian(\/|$)|armbian\.com\/apt/ {
+          sub(/https?:\/\/[^[:space:]]+/, u)
+        }
+        {print}
+      ' "$file" > "$tmp"
+      ;;
+  esac
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
+  return 0
+}
+
 write_apt_sources(){
-  local name="$1" url="$2" ts disabled_dir
+  local name="$1" url="$2" ts armbian_url file found_armbian key_opt
   ts="$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$BASE_DIR/apt备份"
   cp -a /etc/apt/sources.list "$BASE_DIR/apt备份/sources.list.$ts" 2>/dev/null || true
-  disabled_dir="$BASE_DIR/apt备份/sources.list.d.$ts"
-  mkdir -p "$disabled_dir"
   if [ -d /etc/apt/sources.list.d ]; then
-    find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) -exec mv -t "$disabled_dir" {} + 2>/dev/null || true
+    cp -a /etc/apt/sources.list.d "$BASE_DIR/apt备份/sources.list.d.$ts" 2>/dev/null || true
   fi
+  armbian_url="$(armbian_mirror_url "$url")"
   if [ "$OS_ID" = ubuntu ]; then
     cat > /etc/apt/sources.list <<EOF_APT
 deb ${url%/}/ $OS_CODENAME main restricted universe multiverse
@@ -260,7 +339,26 @@ deb ${url%/}/debian/ $OS_CODENAME-updates main contrib non-free non-free-firmwar
 deb ${url%/}/debian-security/ $OS_CODENAME-security main contrib non-free non-free-firmware
 EOF_APT
   fi
+  found_armbian=0
+  if [ -d /etc/apt/sources.list.d ]; then
+    while IFS= read -r -d '' file; do
+      if rewrite_armbian_source_file "$file" "$armbian_url"; then
+        found_armbian=1
+      fi
+    done < <(find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null)
+  fi
+  if [ "$found_armbian" -eq 0 ] && [ -r /etc/armbian-release ]; then
+    mkdir -p /etc/apt/sources.list.d
+    key_opt=""
+    [ -r /usr/share/keyrings/armbian.gpg ] && key_opt=" [signed-by=/usr/share/keyrings/armbian.gpg]"
+    cat > /etc/apt/sources.list.d/armbian.list <<EOF_ARMBIAN
+deb${key_opt} ${armbian_url%/}/ $OS_CODENAME main ${OS_CODENAME}-utils
+EOF_ARMBIAN
+    found_armbian=1
+    warn "没有找到现有 Armbian 源，已按常见格式创建 /etc/apt/sources.list.d/armbian.list。"
+  fi
   ok "APT 源已切换为：$name"
+  [ "$found_armbian" -eq 1 ] && ok "Armbian 源已切换为：$armbian_url"
   info "原配置已备份到：$BASE_DIR/apt备份"
 }
 
@@ -358,14 +456,20 @@ backup_now(){
   cp -a "$CONFIG_FILE" "$target/easepi-r2-script/网络配置.env" 2>/dev/null || true
   cp -a "$NETWORK_DIR" "$target/systemd-network" 2>/dev/null || true
   cp -a /etc/dnsmasq.d "$target/dnsmasq.d" 2>/dev/null || true
-  cp -a "$NFT_CONF" "$target/nftables.conf" 2>/dev/null || true
+  cp -a "$NFT_MAIN_CONF" "$target/nftables.conf" 2>/dev/null || true
+  mkdir -p "$target/nftables.d"
+  cp -a "$NFT_CONF" "$target/nftables.d/easepi-r2-nat.nft" 2>/dev/null || true
   cp -a "$SYSCTL_CONF" "$target/ip-forward.conf" 2>/dev/null || true
   cp -a /etc/ssh/sshd_config "$target/sshd_config" 2>/dev/null || true
   cp -a /etc/ssh/sshd_config.d "$target/sshd_config.d" 2>/dev/null || true
   cp -a "$RESOLVED_DIR" "$target/resolved.conf.d" 2>/dev/null || true
   cp -a /etc/resolv.conf "$target/resolv.conf" 2>/dev/null || true
   cp -a /etc/hostapd "$target/hostapd" 2>/dev/null || true
+  cp -a "$HOSTAPD_DEFAULT" "$target/hostapd.default" 2>/dev/null || true
   cp -a "$WPA_DIR" "$target/wpa_supplicant" 2>/dev/null || true
+  cp -a "$LTE_POLICY_SCRIPT" "$target/lte4g-policy-route.sh" 2>/dev/null || true
+  cp -a "$LTE_POLICY_SERVICE" "$target/lte4g-policy-route.service" 2>/dev/null || true
+  cp -a "$LTE_POLICY_TIMER" "$target/lte4g-policy-route.timer" 2>/dev/null || true
   ls -1dt "$BACKUP_DIR"/* 2>/dev/null | tail -n +6 | xargs -r rm -rf
   echo "$target"
 }
@@ -379,16 +483,26 @@ restore_backup(){
   target="$(ls -1dt "$BACKUP_DIR"/* 2>/dev/null | sed -n "${num}p")"
   [ -n "$target" ] || { err "无效序号"; pause; return; }
   confirm "确认恢复 $target？" n || return
-  rm -rf "$NETWORK_DIR"; mkdir -p "$NETWORK_DIR"; cp -a "$target/systemd-network/." "$NETWORK_DIR/" 2>/dev/null || true
-  rm -rf /etc/dnsmasq.d; mkdir -p /etc/dnsmasq.d; cp -a "$target/dnsmasq.d/." /etc/dnsmasq.d/ 2>/dev/null || true
-  cp -a "$target/nftables.conf" "$NFT_CONF" 2>/dev/null || true
+  mkdir -p "$NETWORK_DIR"
+  clean_networkd_files
+  find "$target/systemd-network" -maxdepth 1 -type f \( -name '20-r2-*' -o -name '2[0-9]-r2-*' -o -name '3[0-9]-r2-*' -o -name '4[0-9]-r2-*' \) -exec cp -a -t "$NETWORK_DIR" {} + 2>/dev/null || true
+  mkdir -p /etc/dnsmasq.d
+  cp -a "$target/dnsmasq.d/easepi-r2-router.conf" "$DNSMASQ_CONF" 2>/dev/null || true
+  mkdir -p "$NFT_DIR"
+  cp -a "$target/nftables.d/easepi-r2-nat.nft" "$NFT_CONF" 2>/dev/null || true
   cp -a "$target/ip-forward.conf" "$SYSCTL_CONF" 2>/dev/null || true
-  cp -a "$target/sshd_config" /etc/ssh/sshd_config 2>/dev/null || true
-  rm -rf /etc/ssh/sshd_config.d; cp -a "$target/sshd_config.d" /etc/ssh/sshd_config.d 2>/dev/null || true
-  rm -rf "$RESOLVED_DIR"; cp -a "$target/resolved.conf.d" "$RESOLVED_DIR" 2>/dev/null || true
-  cp -a "$target/resolv.conf" /etc/resolv.conf 2>/dev/null || true
-  rm -rf /etc/hostapd; cp -a "$target/hostapd" /etc/hostapd 2>/dev/null || true
-  rm -rf "$WPA_DIR"; cp -a "$target/wpa_supplicant" "$WPA_DIR" 2>/dev/null || true
+  mkdir -p /etc/ssh/sshd_config.d
+  cp -a "$target/sshd_config.d/99-easepi-r2-root-login.conf" /etc/ssh/sshd_config.d/99-easepi-r2-root-login.conf 2>/dev/null || true
+  mkdir -p "$RESOLVED_DIR"
+  cp -a "$target/resolved.conf.d/easepi-r2-dns.conf" "$RESOLVED_CONF" 2>/dev/null || true
+  mkdir -p /etc/hostapd /etc/default
+  cp -a "$target/hostapd/hostapd.conf" "$HOSTAPD_CONF" 2>/dev/null || true
+  cp -a "$target/hostapd.default" "$HOSTAPD_DEFAULT" 2>/dev/null || true
+  mkdir -p "$WPA_DIR"
+  find "$target/wpa_supplicant" -maxdepth 1 -type f -name 'wpa_supplicant-*.conf' -exec cp -a -t "$WPA_DIR" {} + 2>/dev/null || true
+  cp -a "$target/lte4g-policy-route.sh" "$LTE_POLICY_SCRIPT" 2>/dev/null || true
+  cp -a "$target/lte4g-policy-route.service" "$LTE_POLICY_SERVICE" 2>/dev/null || true
+  cp -a "$target/lte4g-policy-route.timer" "$LTE_POLICY_TIMER" 2>/dev/null || true
   if [ -r "$target/easepi-r2-script/网络配置.env" ]; then
     mkdir -p "$BASE_DIR"
     cp -a "$target/easepi-r2-script/网络配置.env" "$CONFIG_FILE"
@@ -503,7 +617,7 @@ $(for d in $dns_list; do echo "DNS=$d"; done)
 
 [DHCPv4]
 UseDNS=no
-RouteMetric=$metric
+$(if [ "$ifname" = lte4g ]; then echo "UseRoutes=no"; echo "RouteMetric=$metric"; else echo "RouteMetric=$metric"; fi)
 EOF_WAN_DHCP
     fi
     idx=$((idx+1))
@@ -552,24 +666,60 @@ nat_rule(){
 }
 
 write_nft(){
+  mkdir -p "$NFT_DIR"
   cat > "$NFT_CONF" <<EOF_NFT
 #!/usr/sbin/nft -f
 # 由 EasePi-R2-Script 生成
-flush ruleset
 
-table inet filter {
-  chain forward {
-    type filter hook forward priority filter; policy accept;
-  }
-}
-
-table ip nat {
+table ip $NFT_TABLE {
   chain postrouting {
     type nat hook postrouting priority srcnat; policy accept;
 $(nat_rule)
   }
 }
 EOF_NFT
+}
+
+ensure_nft_main_include(){
+  mkdir -p "$NFT_DIR"
+  if [ ! -e "$NFT_MAIN_CONF" ]; then
+    cat > "$NFT_MAIN_CONF" <<'EOF_NFT_MAIN'
+#!/usr/sbin/nft -f
+include "/etc/nftables.d/*.nft"
+EOF_NFT_MAIN
+    return
+  fi
+  if grep -qs '由 EasePi-R2-Script 生成' "$NFT_MAIN_CONF" && grep -qs 'flush ruleset' "$NFT_MAIN_CONF"; then
+    cp -a "$NFT_MAIN_CONF" "$BASE_DIR/nftables.conf.$(date +%Y%m%d-%H%M%S).bak" 2>/dev/null || true
+    cat > "$NFT_MAIN_CONF" <<'EOF_NFT_MAIN'
+#!/usr/sbin/nft -f
+# EasePi-R2-Script：主文件只加载片段，不清空其他规则
+include "/etc/nftables.d/*.nft"
+EOF_NFT_MAIN
+    return
+  fi
+  grep -qsE '^[[:space:]]*include[[:space:]]+"/etc/nftables\.d/\*\.nft"' "$NFT_MAIN_CONF" && return
+  cp -a "$NFT_MAIN_CONF" "$BASE_DIR/nftables.conf.$(date +%Y%m%d-%H%M%S).bak" 2>/dev/null || true
+  {
+    echo
+    echo '# EasePi-R2-Script：加载脚本自己的 nftables 片段，不清空其他规则'
+    echo 'include "/etc/nftables.d/*.nft"'
+  } >> "$NFT_MAIN_CONF"
+}
+
+load_nft_rules(){
+  ensure_nft_main_include
+  if ! has_cmd nft; then
+    warn "nft 命令不存在，请先安装 nftables。"
+    return 1
+  fi
+  if ! nft -c -f "$NFT_CONF" >/dev/null 2>&1; then
+    warn "nftables 规则校验失败，请检查 $NFT_CONF"
+    return 1
+  fi
+  nft delete table ip "$NFT_TABLE" 2>/dev/null || true
+  nft -f "$NFT_CONF" 2>/dev/null || { warn "nftables 规则加载失败，请检查 $NFT_CONF"; return 1; }
+  return 0
 }
 
 write_sysctl(){
@@ -579,6 +729,83 @@ net.ipv4.ip_forward=1
 EOF_SYSCTL
 }
 
+write_lte4g_policy_files(){
+  mkdir -p "$(dirname "$LTE_POLICY_SCRIPT")" "$(dirname "$LTE_POLICY_SERVICE")"
+  cat > "$LTE_POLICY_SCRIPT" <<'EOF_LTE_POLICY'
+#!/usr/bin/env bash
+set -u
+
+IFACE="${1:-lte4g}"
+TABLE="${2:-1004}"
+PRIO="${3:-1004}"
+
+[ -d "/sys/class/net/$IFACE" ] || exit 0
+
+ADDR="$(ip -o -4 addr show dev "$IFACE" scope global 2>/dev/null | awk '{print $4; exit}')"
+[ -n "$ADDR" ] || exit 0
+ADDR_IP="${ADDR%/*}"
+
+IFINDEX="$(cat "/sys/class/net/$IFACE/ifindex" 2>/dev/null || true)"
+LEASE="/run/systemd/netif/leases/$IFINDEX"
+ROUTER=""
+if [ -r "$LEASE" ]; then
+  ROUTER="$(awk -F= '$1=="ROUTER"{print $2; exit}' "$LEASE")"
+  ROUTER="${ROUTER%% *}"
+fi
+[ -n "$ROUTER" ] || ROUTER="$(ip -4 route show default dev "$IFACE" 2>/dev/null | awk '{print $3; exit}')"
+[ -n "$ROUTER" ] || exit 0
+
+while ip -4 rule del priority "$PRIO" 2>/dev/null; do :; done
+ip -4 route flush table "$TABLE" 2>/dev/null || true
+ip -4 route show dev "$IFACE" scope link 2>/dev/null | while read -r route; do
+  [ -n "$route" ] && ip -4 route replace table "$TABLE" $route 2>/dev/null || true
+done
+ip -4 route replace default via "$ROUTER" dev "$IFACE" table "$TABLE"
+ip -4 rule add priority "$PRIO" from "$ADDR_IP/32" table "$TABLE"
+exit 0
+EOF_LTE_POLICY
+  chmod 755 "$LTE_POLICY_SCRIPT"
+
+  cat > "$LTE_POLICY_SERVICE" <<EOF_LTE_SERVICE
+[Unit]
+Description=EasePi-R2 lte4g 管理入口策略路由
+After=systemd-networkd.service
+Wants=systemd-networkd.service
+
+[Service]
+Type=oneshot
+ExecStart=$LTE_POLICY_SCRIPT lte4g $LTE_POLICY_TABLE $LTE_POLICY_PRIO
+EOF_LTE_SERVICE
+
+  cat > "$LTE_POLICY_TIMER" <<'EOF_LTE_TIMER'
+[Unit]
+Description=定时刷新 EasePi-R2 lte4g 管理入口策略路由
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Unit=easepi-r2-lte4g-policy-route.service
+
+[Install]
+WantedBy=timers.target
+EOF_LTE_TIMER
+}
+
+sync_lte4g_policy_service(){
+  write_lte4g_policy_files
+  if wan_has_iface lte4g; then
+    systemctl daemon-reload || true
+    systemctl enable --now easepi-r2-lte4g-policy-route.timer >/dev/null 2>&1 || true
+    systemctl start easepi-r2-lte4g-policy-route.service >/dev/null 2>&1 || true
+  else
+    systemctl disable --now easepi-r2-lte4g-policy-route.timer >/dev/null 2>&1 || true
+    systemctl stop easepi-r2-lte4g-policy-route.service >/dev/null 2>&1 || true
+    while ip -4 rule del priority "$LTE_POLICY_PRIO" 2>/dev/null; do :; done
+    ip -4 route flush table "$LTE_POLICY_TABLE" 2>/dev/null || true
+  fi
+}
+
 write_all_configs(){
   save_config
   write_dns_config
@@ -586,6 +813,7 @@ write_all_configs(){
   write_dnsmasq
   write_nft
   write_sysctl
+  write_lte4g_policy_files
 }
 
 reload_services(){
@@ -598,10 +826,10 @@ reload_services(){
   systemctl disable systemd-networkd-wait-online.service >/dev/null 2>&1 || true
   systemctl mask systemd-networkd-wait-online.service >/dev/null 2>&1 || true
   systemctl restart systemd-networkd 2>/dev/null || warn "systemd-networkd 重启失败，请查看 journalctl -u systemd-networkd"
-  nft -f "$NFT_CONF" 2>/dev/null || warn "nftables 规则加载失败，请检查 $NFT_CONF"
-  systemctl restart nftables 2>/dev/null || true
+  load_nft_rules || true
   systemctl restart dnsmasq 2>/dev/null || warn "dnsmasq 重启失败，请查看 journalctl -u dnsmasq"
   systemctl restart systemd-resolved 2>/dev/null || true
+  sync_lte4g_policy_service
   ok "networkd / dnsmasq / nftables 已重新加载。"
 }
 
@@ -635,10 +863,14 @@ show_network(){
   echo "DNS："; resolvectl dns 2>/dev/null | sed 's/^/  /' || cat /etc/resolv.conf 2>/dev/null | sed 's/^/  /'
   echo "------------------------------------------------------------"
   echo "服务："
-  local svc
-  for svc in systemd-networkd dnsmasq nftables ssh sshd hostapd "wpa_supplicant@$WLAN_IFACE"; do
-    systemctl list-unit-files "$svc.service" >/dev/null 2>&1 || continue
-    printf '  %-24s %s / %s\n' "$svc" "$(systemctl is-active "$svc" 2>/dev/null || true)" "$(systemctl is-enabled "$svc" 2>/dev/null || true)"
+  local svc unit
+  for svc in systemd-networkd dnsmasq nftables ssh sshd hostapd "wpa_supplicant@$WLAN_IFACE" easepi-r2-lte4g-policy-route.timer; do
+    case "$svc" in
+      *.service|*.timer) unit="$svc" ;;
+      *) unit="$svc.service" ;;
+    esac
+    systemctl list-unit-files "$unit" >/dev/null 2>&1 || continue
+    printf '  %-36s %s / %s\n' "$unit" "$(systemctl is-active "$unit" 2>/dev/null || true)" "$(systemctl is-enabled "$unit" 2>/dev/null || true)"
   done
   pause
 }
@@ -737,8 +969,7 @@ configure_nat(){
   echo "$WAN_CONFIG" | awk -F'|' '{printf "  %s  模式=%s  跃点=%s\n",$1,$2,$3}'
   NAT_OUT="$(read_default "NAT 出口，可填多个网卡，空格分隔" "$NAT_OUT")"
   write_all_configs
-  nft -f "$NFT_CONF" 2>/dev/null || warn "nftables 规则加载失败"
-  systemctl restart nftables 2>/dev/null || true
+  load_nft_rules || true
   ok "NAT 出口已更新。"
   pause
 }
@@ -765,7 +996,7 @@ configure_metric(){
 enable_lte4g(){
   need_root
   load_config
-  LTE4G_METRIC="$(read_default "lte4g DHCP 默认路由 metric，建议 800-1000；只访问 R2 本身时也可保留高跃点" "$LTE4G_METRIC")"
+  LTE4G_METRIC="$(read_default "lte4g DHCP 路由 metric，默认不把 LTE 当作备用出网" "$LTE4G_METRIC")"
   if ! echo "$WAN_CONFIG" | awk -F'|' '$1=="lte4g"{found=1} END{exit !found}'; then
     WAN_CONFIG="${WAN_CONFIG:+$WAN_CONFIG
 }lte4g|dhcp|$LTE4G_METRIC|||$DEVICE_DNS"
@@ -773,7 +1004,8 @@ enable_lte4g(){
     WAN_CONFIG="$(echo "$WAN_CONFIG" | awk -F'|' -v m="$LTE4G_METRIC" 'BEGIN{OFS="|"} $1=="lte4g"{$2="dhcp";$3=m} {print}')"
   fi
   write_all_configs
-  info "lte4g 会通过 DHCP 获取地址。高 metric 只让它作为备用默认路由，不影响从 lte4g 访问 R2 本机。"
+  info "lte4g 会通过 DHCP 获取地址，但 networkd 不把它加入主默认路由。"
+  info "脚本会启用策略路由：从 LTE 地址进入 R2 的 SSH，回复包仍从 lte4g 返回。"
   confirm "是否立即重新加载服务？" y && reload_services
   pause
 }
@@ -785,6 +1017,8 @@ wifi_client(){
   local scan_file ssid choice pass wpa_conf first_wifi
   first_wifi="$(wifi_ifaces | head -1)"
   WLAN_IFACE="$(read_default "无线网卡" "${first_wifi:-wlan0}")"
+  systemctl disable --now hostapd >/dev/null 2>&1 || true
+  remove_lan_iface "$WLAN_IFACE"
   rfkill unblock wifi 2>/dev/null || true
   echo "正在扫描 WiFi，请稍等..."
   scan_file="$(mktemp)"
@@ -823,8 +1057,8 @@ EOF_WPA_OPEN
   fi
   WLAN_MODE="客户端：$ssid"
   save_config
-  systemctl enable --now "wpa_supplicant@$WLAN_IFACE" 2>/dev/null || true
   write_all_configs
+  systemctl enable --now "wpa_supplicant@$WLAN_IFACE" 2>/dev/null || true
   reload_services
   info "已配置为客户端。metric 较高时，WiFi 通常只作为备用线路。"
   pause
@@ -837,6 +1071,8 @@ wifi_ap(){
   local first_wifi ssid enc pass country channel bridge_to_lan
   first_wifi="$(wifi_ifaces | head -1)"
   WLAN_IFACE="$(read_default "无线网卡" "${first_wifi:-wlan0}")"
+  systemctl disable --now "wpa_supplicant@$WLAN_IFACE" >/dev/null 2>&1 || true
+  remove_wan_iface "$WLAN_IFACE"
   ssid="$(read_default "热点名称" "EasePi-R2")"
   echo "加密方式：1 WPA2-PSK，2 开放"
   read -r -p "请选择 [1]: " enc
@@ -883,13 +1119,16 @@ EOF_HOSTAPD
       *" $WLAN_IFACE "*) ;;
       *) LAN_IFACES="$LAN_IFACES $WLAN_IFACE" ;;
     esac
+  else
+    remove_lan_iface "$WLAN_IFACE"
   fi
   WLAN_MODE="热点：$ssid"
   save_config
   write_all_configs
+  reload_services
   systemctl unmask hostapd 2>/dev/null || true
   systemctl enable --now hostapd 2>/dev/null || true
-  reload_services
+  systemctl restart hostapd 2>/dev/null || warn "hostapd 启动失败，请查看 journalctl -u hostapd"
   ok "热点配置已写入。"
   pause
 }
@@ -966,7 +1205,7 @@ main_menu(){
     echo "7. DNS 配置"
     echo "8. 修改 NAT 出口"
     echo "9. 修改默认路由跃点"
-    echo "10. 开启 lte4g 保底 DHCP 线路"
+    echo "10. 开启 lte4g 管理入口"
     echo "11. wlan 设置"
     echo "12. 重新加载 networkd / dnsmasq / nftables"
     echo "13. 一键安装所有网络依赖"
