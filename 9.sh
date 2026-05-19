@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-VERSION="2026-05-19-routeros-chr-installer-r3"
+VERSION="2026-05-19-routeros-chr-installer-r6"
 
 INSTALL_CMD="/usr/local/sbin/routerosinstall"
 CONSOLE_CMD="/usr/local/sbin/routeros"
@@ -14,7 +14,8 @@ START_SCRIPT="$LIB_DIR/start-vm.sh"
 SERVICE_FILE="/etc/systemd/system/routeros-chr.service"
 ROLLBACK_SCRIPT="$CONFIG_DIR/last-hostnet-rollback.sh"
 NM_UNMANAGED_CONF="/etc/NetworkManager/conf.d/99-routerosinstall-unmanaged.conf"
-NETWORKD_PREFIX="/etc/systemd/network/80-routerosinstall"
+NETWORKD_PREFIX="/etc/systemd/network/00-routerosinstall"
+NETWORKD_LEGACY_PREFIX="/etc/systemd/network/80-routerosinstall"
 
 RED=$'\033[31m'
 GREEN=$'\033[32m'
@@ -460,8 +461,19 @@ pkg_installed(){
   dpkg -s "$1" >/dev/null 2>&1
 }
 
+find_aarch64_efi_firmware(){
+  local fw
+  for fw in \
+    /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
+    /usr/share/AAVMF/AAVMF_CODE.fd \
+    /usr/share/AAVMF/AAVMF_CODE.no-secboot.fd; do
+    [ -r "$fw" ] && { printf '%s\n' "$fw"; return 0; }
+  done
+  return 1
+}
+
 dependency_report(){
-  local arch kernel virt kvm_state vhost_state qemu_state
+  local arch kernel virt kvm_state vhost_state qemu_state efi_fw efi_state
   arch="$(uname -m)"
   kernel="$(uname -r)"
   virt="未知"
@@ -495,6 +507,14 @@ dependency_report(){
   printf '%s\n' "KVM: $kvm_state"
   printf '%s\n' "vhost-net: $vhost_state"
   printf '%s\n' "QEMU: $qemu_state"
+  if [ "$arch" = "aarch64" ] || [ "$arch" = "arm64" ]; then
+    if efi_fw="$(find_aarch64_efi_firmware)"; then
+      efi_state="$efi_fw"
+    else
+      efi_state="missing qemu-efi-aarch64; RouterOS ARM64 EFI image will not boot"
+    fi
+    printf '%s\n' "AArch64 UEFI: $efi_state"
+  fi
   printf '%s\n' "systemd: $(has_cmd systemctl && systemctl --version | head -n1 || echo 未发现)"
   printf '\n'
 
@@ -539,6 +559,9 @@ install_dependencies(){
     kmod
     procps
   )
+  case "$(uname -m)" in
+    aarch64|arm64) packages+=(qemu-efi-aarch64) ;;
+  esac
   missing=()
   for pkg in "${packages[@]}"; do
     pkg_installed "$pkg" || missing+=("$pkg")
@@ -1080,8 +1103,17 @@ case "$ACTION" in
       if [ -n "$iface" ] && [ "$iface" != "none" ]; then
         if ip link show "$iface" >/dev/null 2>&1; then
           ip addr flush dev "$iface" 2>/dev/null || true
+          ip link set "$iface" nomaster 2>/dev/null || true
           ip link set "$iface" up 2>/dev/null || true
-          ip link set "$iface" master "$br" 2>/dev/null || true
+          if ! ip link set "$iface" master "$br" 2>/dev/null; then
+            echo "routerosinstall: failed to attach $iface to $br" >&2
+            exit 1
+          fi
+          current_master="$(basename "$(readlink -f "/sys/class/net/$iface/master" 2>/dev/null)" 2>/dev/null || true)"
+          if [ "$current_master" != "$br" ]; then
+            echo "routerosinstall: $iface is still attached to ${current_master:-none}, expected $br" >&2
+            exit 1
+          fi
         else
           echo "routerosinstall: host iface $iface not found" >&2
         fi
@@ -1164,8 +1196,19 @@ qemu_img_format_probe(){
   return 1
 }
 
+find_aarch64_efi_firmware(){
+  local fw
+  for fw in \
+    /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
+    /usr/share/AAVMF/AAVMF_CODE.fd \
+    /usr/share/AAVMF/AAVMF_CODE.no-secboot.fd; do
+    [ -r "$fw" ] && { printf '%s\n' "$fw"; return 0; }
+  done
+  return 1
+}
+
 preflight_start(){
-  local tap mac actual bad=0
+  local tap mac actual arch bad=0
   if ! command -v "$QEMU_BIN" >/dev/null 2>&1; then
     echo "routerosinstall: QEMU not found: $QEMU_BIN" >&2
     return 1
@@ -1214,6 +1257,11 @@ preflight_start(){
       bad=1
     fi
   done
+  arch="$(uname -m)"
+  if { [ "$arch" = "aarch64" ] || [ "$arch" = "arm64" ]; } && ! find_aarch64_efi_firmware >/dev/null; then
+    echo "routerosinstall: missing AArch64 UEFI firmware; install qemu-efi-aarch64" >&2
+    bad=1
+  fi
   [ "$bad" -eq 0 ]
 }
 
@@ -1223,11 +1271,14 @@ rm -f "$SERIAL_SOCK" "$MONITOR_SOCK" "$PID_FILE"
 preflight_start
 
 arch="$(uname -m)"
+efi_fw=""
 args=(-name routeros-chr)
 if { [ "$arch" = "aarch64" ] || [ "$arch" = "arm64" ]; } && [ -e /dev/kvm ]; then
-  args+=(-machine virt,accel=kvm,gic-version=3 -cpu host)
+  efi_fw="$(find_aarch64_efi_firmware)"
+  args+=(-machine virt,accel=kvm,gic-version=3 -cpu host -bios "$efi_fw")
 elif [ "$arch" = "aarch64" ] || [ "$arch" = "arm64" ]; then
-  args+=(-machine virt -cpu cortex-a72)
+  efi_fw="$(find_aarch64_efi_firmware)"
+  args+=(-machine virt -cpu cortex-a72 -bios "$efi_fw")
 else
   echo "routerosinstall: unsupported host arch for this script: $arch" >&2
   exit 1
@@ -1246,7 +1297,7 @@ for i in "${!taps[@]}"; do
   mac="${macs[$i]:-52:54:00:21:00:ff}"
   netid="net$((i+1))"
   args+=(-netdev "tap,id=$netid,ifname=$tap,script=no,downscript=no,vhost=$vhost,queues=$NET_QUEUES")
-  args+=(-device "virtio-net-pci,netdev=$netid,mac=$mac,mq=on,vectors=$vectors")
+  args+=(-device "virtio-net-pci,netdev=$netid,mac=$mac,mq=on,vectors=$vectors,romfile=")
 done
 
 args+=(-serial "unix:$SERIAL_SOCK,server,nowait")
@@ -1330,6 +1381,7 @@ EOF_SERVICE
 
 remove_persistent_network_files(){
   rm -f "$NETWORKD_PREFIX"-*.netdev "$NETWORKD_PREFIX"-*.network 2>/dev/null || true
+  rm -f "$NETWORKD_LEGACY_PREFIX"-*.netdev "$NETWORKD_LEGACY_PREFIX"-*.network 2>/dev/null || true
   rm -f "$NM_UNMANAGED_CONF" 2>/dev/null || true
 }
 
@@ -1354,6 +1406,7 @@ write_networkd_files(){
   mkdir -p /etc/systemd/network
 
   rm -f "$NETWORKD_PREFIX"-*.netdev "$NETWORKD_PREFIX"-*.network 2>/dev/null || true
+  rm -f "$NETWORKD_LEGACY_PREFIX"-*.netdev "$NETWORKD_LEGACY_PREFIX"-*.network 2>/dev/null || true
 
   for i in "${!bridges[@]}"; do
     br="${bridges[$i]}"
@@ -1412,6 +1465,7 @@ write_persistent_network_files(){
       ;;
     nm-unmanaged)
       rm -f "$NETWORKD_PREFIX"-*.netdev "$NETWORKD_PREFIX"-*.network 2>/dev/null || true
+      rm -f "$NETWORKD_LEGACY_PREFIX"-*.netdev "$NETWORKD_LEGACY_PREFIX"-*.network 2>/dev/null || true
       write_nm_unmanaged_file
       ;;
     both)
@@ -1513,7 +1567,8 @@ build_preset_rsc(){
   lan_port_cmds=""
   for port in $ROS_LAN_PORTS; do
     port_q="$(ros_quote "$port")"
-    lan_port_cmds+=$(printf ':do { /interface bridge port add bridge=%s interface=%s comment="routerosinstall: LAN port" } on-error={}\n' "$bridge_q" "$port_q")
+    lan_port_cmds+=$(printf ':do { /interface bridge port add bridge=%s interface=%s comment="routerosinstall: LAN port" } on-error={}' "$bridge_q" "$port_q")
+    lan_port_cmds+=$'\n'
   done
 
   atomic_write "$PRESET_RSC" 0644 <<EOF_RSC
