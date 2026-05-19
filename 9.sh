@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-VERSION="2026-05-19-routeros-chr-installer-r2"
+VERSION="2026-05-19-routeros-chr-installer-r3"
 
 INSTALL_CMD="/usr/local/sbin/routerosinstall"
 CONSOLE_CMD="/usr/local/sbin/routeros"
@@ -1261,9 +1261,42 @@ EOF_START
 CONFIG_FILE="/etc/routerosinstall/config.env"
 [ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 SERIAL_SOCK="${SERIAL_SOCK:-/run/routeros/serial.sock}"
-if [ ! -S "$SERIAL_SOCK" ]; then
+
+socket_ready(){
+  [ -S "$SERIAL_SOCK" ] || return 1
+  if command -v ss >/dev/null 2>&1; then
+    ss -xl 2>/dev/null | awk '{print $5}' | grep -Fxq "$SERIAL_SOCK"
+  else
+    return 0
+  fi
+}
+
+show_failure_hint(){
   echo "RouterOS 串口未就绪: $SERIAL_SOCK" >&2
-  echo "请先执行: systemctl start routeros-chr" >&2
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --no-pager --full status routeros-chr.service 2>/dev/null | sed -n '1,18p' >&2 || true
+    echo "更多日志: journalctl -u routeros-chr.service -n 80 --no-pager" >&2
+  fi
+}
+
+if ! systemctl is-active --quiet routeros-chr.service 2>/dev/null; then
+  echo "RouterOS 服务未运行，正在启动 routeros-chr.service..." >&2
+  rm -f "$SERIAL_SOCK" 2>/dev/null || true
+  if ! systemctl start routeros-chr.service; then
+    show_failure_hint
+    exit 1
+  fi
+fi
+
+tries=0
+while [ "$tries" -lt 30 ]; do
+  socket_ready && break
+  tries=$((tries + 1))
+  sleep 0.2
+done
+
+if ! socket_ready; then
+  show_failure_hint
   exit 1
 fi
 echo "进入 RouterOS 控制台。退出方式: 按 Ctrl+]。"
