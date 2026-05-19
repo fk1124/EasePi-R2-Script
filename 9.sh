@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-VERSION="2026-05-19-routeros-chr-installer-r7"
+VERSION="2026-05-19-routeros-chr-installer-r10"
 
 INSTALL_CMD="/usr/local/sbin/routerosinstall"
 CONSOLE_CMD="/usr/local/sbin/routeros"
@@ -340,11 +340,17 @@ validate_vm_config(){
 }
 
 validate_routeros_config(){
-  local ok_flag=0 dns dns_trim start_int end_int lan_net start_net end_net _dns_list
+  local ok_flag=0 dns dns_trim start_int end_int lan_net start_net end_net item _dns_list
   [ -n "${ROS_IDENTITY:-}" ] || { err "RouterOS identity 不能为空。"; ok_flag=1; }
   is_ros_ifname "$ROS_WAN_IFACE" || { err "WAN 口名称非法: $ROS_WAN_IFACE"; ok_flag=1; }
   is_ros_ifname "$ROS_LAN_BRIDGE" || { err "LAN bridge 名称非法: $ROS_LAN_BRIDGE"; ok_flag=1; }
   validate_name_list "LAN 口列表" is_ros_ifname "$ROS_LAN_PORTS" || ok_flag=1
+  for item in $ROS_LAN_PORTS; do
+    if [ "$item" = "$ROS_WAN_IFACE" ]; then
+      err "WAN 口不能同时作为 LAN 口: $item"
+      ok_flag=1
+    fi
+  done
   is_ipv4 "$ROS_LAN_IP" || { err "LAN IP 非法: $ROS_LAN_IP"; ok_flag=1; }
   is_prefix "$ROS_LAN_PREFIX" || { err "LAN 掩码前缀非法: $ROS_LAN_PREFIX"; ok_flag=1; }
   is_ipv4 "$ROS_DHCP_START" || { err "DHCP 起始地址非法: $ROS_DHCP_START"; ok_flag=1; }
@@ -1375,6 +1381,7 @@ WantedBy=multi-user.target
 EOF_SERVICE
 
   write_persistent_network_files
+  build_preset_rsc || warn "RouterOS 预设置脚本生成失败，请在菜单 4 检查参数。"
 
   systemctl daemon-reload 2>/dev/null || true
 }
@@ -1607,7 +1614,11 @@ build_preset_rsc(){
   lan_port_cmds=""
   for port in $ROS_LAN_PORTS; do
     port_q="$(ros_quote "$port")"
-    lan_port_cmds+=$(printf ':do { /interface bridge port add bridge=%s interface=%s comment="routerosinstall: LAN port" } on-error={}' "$bridge_q" "$port_q")
+    lan_port_cmds+=$(printf ':do { /interface bridge port remove [find interface=%s] } on-error={}' "$port_q")
+    lan_port_cmds+=$'\n'
+    lan_port_cmds+=$(printf ':do { /ip dhcp-client remove [find interface=%s] } on-error={}' "$port_q")
+    lan_port_cmds+=$'\n'
+    lan_port_cmds+=$(printf ':do { /interface bridge port add bridge=%s interface=%s edge=yes comment="routerosinstall: LAN port" } on-error={}' "$bridge_q" "$port_q")
     lan_port_cmds+=$'\n'
   done
 
@@ -1621,37 +1632,44 @@ build_preset_rsc(){
 :do { /interface bridge add name=$bridge_q comment="routerosinstall: LAN bridge" protocol-mode=rstp } on-error={}
 :do { /interface bridge set [find name=$bridge_q] comment="routerosinstall: LAN bridge" protocol-mode=rstp } on-error={}
 
-/interface bridge port remove [find comment="routerosinstall: LAN port"]
+:do { /interface bridge port remove [find comment="routerosinstall: LAN port"] } on-error={}
 $lan_port_cmds
 
-/ip dhcp-client remove [find comment="routerosinstall: WAN DHCP"]
-/ip dhcp-client add interface=$wan_q add-default-route=yes use-peer-dns=no disabled=no comment="routerosinstall: WAN DHCP"
+:do { /ip dhcp-client remove [find comment="routerosinstall: WAN DHCP"] } on-error={}
+:if ([:len [/ip dhcp-client find interface=$wan_q]] = 0) do={ /ip dhcp-client add interface=$wan_q add-default-route=yes use-peer-dns=no disabled=no comment="routerosinstall: WAN DHCP" } else={ /ip dhcp-client set [find interface=$wan_q] add-default-route=yes use-peer-dns=no disabled=no comment="routerosinstall: WAN DHCP" }
 
-/ip address remove [find comment="routerosinstall: LAN gateway"]
+:do { /interface list add name=WAN comment="routerosinstall: WAN list" } on-error={}
+:do { /interface list add name=LAN comment="routerosinstall: LAN list" } on-error={}
+:do { /interface list member remove [find comment~"routerosinstall:"] } on-error={}
+:do { /interface list member add list=WAN interface=$wan_q comment="routerosinstall: WAN member" } on-error={}
+:do { /interface list member add list=LAN interface=$bridge_q comment="routerosinstall: LAN member" } on-error={}
+
+:do { /ip address remove [find comment="routerosinstall: LAN gateway"] } on-error={}
 /ip address add address=$ROS_LAN_IP/$ROS_LAN_PREFIX interface=$bridge_q comment="routerosinstall: LAN gateway"
 
-/ip pool remove [find name="pool-lan"]
+:do { /ip dhcp-server remove [find name="dhcp-lan"] } on-error={}
+:do { /ip dhcp-server network remove [find comment="routerosinstall: LAN DHCP network"] } on-error={}
+:do { /ip pool remove [find name="pool-lan"] } on-error={}
 /ip pool add name=pool-lan ranges=$ROS_DHCP_START-$ROS_DHCP_END
 
-/ip dhcp-server remove [find name="dhcp-lan"]
 /ip dhcp-server add name=dhcp-lan interface=$bridge_q address-pool=pool-lan lease-time=12h disabled=no
-/ip dhcp-server network remove [find comment="routerosinstall: LAN DHCP network"]
 /ip dhcp-server network add address=$lan_cidr gateway=$ROS_LAN_IP dns-server=$ROS_LAN_IP comment="routerosinstall: LAN DHCP network"
 
 /ip dns set allow-remote-requests=yes servers=$dns_clean
 
-/ip firewall nat remove [find comment~"routerosinstall:"]
+:do { /ip firewall nat remove [find comment~"routerosinstall:"] } on-error={}
 /ip firewall nat add chain=srcnat out-interface=$wan_q action=masquerade comment="routerosinstall: NAT LAN to WAN"
 
-/ip firewall filter remove [find comment~"routerosinstall:"]
-/ip firewall filter add chain=input action=accept connection-state=established,related comment="routerosinstall: allow established input"
-/ip firewall filter add chain=input action=drop connection-state=invalid comment="routerosinstall: drop invalid input"
-/ip firewall filter add chain=input action=accept in-interface=$bridge_q comment="routerosinstall: allow LAN to router"
-/ip firewall filter add chain=input action=accept protocol=icmp comment="routerosinstall: allow ping"
-/ip firewall filter add chain=forward action=fasttrack-connection connection-state=established,related comment="routerosinstall: fasttrack established related"
-/ip firewall filter add chain=forward action=accept connection-state=established,related comment="routerosinstall: accept established related"
-/ip firewall filter add chain=forward action=drop connection-state=invalid comment="routerosinstall: drop invalid forward"
-/ip firewall filter add chain=forward action=accept in-interface=$bridge_q out-interface=$wan_q comment="routerosinstall: allow LAN to WAN"
+:do { /ip firewall filter remove [find comment~"routerosinstall:"] } on-error={}
+/ip firewall filter add chain=input action=accept connection-state=established,related comment="routerosinstall: 10 allow established input"
+/ip firewall filter add chain=input action=drop connection-state=invalid comment="routerosinstall: 11 drop invalid input"
+/ip firewall filter add chain=input action=accept in-interface=$bridge_q comment="routerosinstall: 12 allow LAN to router"
+/ip firewall filter add chain=input action=accept protocol=icmp comment="routerosinstall: 13 allow ping"
+/ip firewall filter add chain=forward action=fasttrack-connection connection-state=established,related comment="routerosinstall: 20 fasttrack established related"
+/ip firewall filter add chain=forward action=accept connection-state=established,related comment="routerosinstall: 21 accept established related"
+/ip firewall filter add chain=forward action=drop connection-state=invalid comment="routerosinstall: 22 drop invalid forward"
+/ip firewall filter add chain=forward action=accept in-interface=$bridge_q out-interface=$wan_q comment="routerosinstall: 23 allow LAN to WAN"
+:do { /ip firewall filter move [find comment~"routerosinstall:"] destination=0 } on-error={}
 
 /ip service enable ssh
 /ip service enable www
@@ -1932,11 +1950,26 @@ main_menu(){
   done
 }
 
+if [ "${1:-}" = "--version" ]; then
+  printf '%s\n' "$VERSION"
+  exit 0
+fi
+
+if [ "${1:-}" = "--generate-preset" ]; then
+  need_root
+  load_config
+  build_preset_rsc
+  ok "已生成 $PRESET_RSC"
+  exit 0
+fi
+
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
   printf '%s\n' "用法:"
   printf '  %s\n' "sudo bash 9.sh            安装 routerosinstall 命令"
   printf '  %s\n' "sudo routerosinstall       打开 RouterOS CHR 安装管理菜单"
   printf '  %s\n' "routeros                   进入 RouterOS 串口控制台"
+  printf '  %s\n' "routerosinstall --version  查看脚本版本"
+  printf '  %s\n' "routerosinstall --generate-preset  生成 RouterOS 预设置脚本"
   exit 0
 fi
 
