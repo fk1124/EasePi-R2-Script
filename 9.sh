@@ -262,15 +262,32 @@ confirm_host_iface_takeover(){
   ALLOW_DANGEROUS_IFACES="${dangerous[*]}"
 }
 
-detect_disk_format(){
-  local path="$1" actual
-  if has_cmd qemu-img && [ -f "$path" ]; then
-    actual="$(qemu-img info "$path" 2>/dev/null | awk -F': ' '/^file format:/ {print $2; exit}')"
-    case "$actual" in
-      raw|qcow2|vdi|vmdk) printf '%s' "$actual"; return 0 ;;
-    esac
+qemu_img_format_probe(){
+  local path="$1" timeout_s="${2:-3}" actual
+  has_cmd qemu-img || return 1
+  has_cmd timeout || return 1
+  [ -f "$path" ] || return 1
+
+  if ! actual="$(timeout "$timeout_s" qemu-img info "$path" 2>/dev/null | awk -F': ' '/^file format:/ {print $2; exit}')"; then
+    return 1
   fi
-  guess_disk_format "$path"
+  case "$actual" in
+    raw|qcow2|vdi|vmdk) printf '%s' "$actual"; return 0 ;;
+  esac
+  return 1
+}
+
+detect_disk_format(){
+  local path="$1" guessed actual
+  guessed="$(guess_disk_format "$path")"
+  case "${path,,}" in
+    *.img|*.raw) printf '%s' "$guessed"; return 0 ;;
+  esac
+  if actual="$(qemu_img_format_probe "$path" 3)"; then
+    printf '%s' "$actual"
+    return 0
+  fi
+  printf '%s' "$guessed"
 }
 
 validate_vm_config(){
@@ -494,6 +511,7 @@ dependency_report(){
   done <<'EOF_DEPS'
 qemu-system-aarch64|qemu-system-arm
 qemu-img|qemu-utils
+timeout|coreutils
 ip|iproute2
 socat|socat
 ssh|openssh-client
@@ -511,6 +529,7 @@ install_dependencies(){
   packages=(
     qemu-system-arm
     qemu-utils
+    coreutils
     iproute2
     socat
     openssh-client
@@ -871,7 +890,10 @@ resize_disk_image(){
     return 0
   fi
   printf '\n'
-  qemu-img info "$IMAGE_PATH" 2>/dev/null || true
+  ls -lh "$IMAGE_PATH" 2>/dev/null || true
+  if [ "${DISK_FORMAT:-raw}" != "raw" ]; then
+    qemu_img_format_probe "$IMAGE_PATH" 3 >/dev/null || warn "镜像格式探测超时或失败，已跳过详细信息显示。"
+  fi
   size="$(read_default "如需扩容请输入目标大小，例如 2G、4G；直接回车跳过" "")"
   [ -z "$size" ] && return 0
   if ! is_size_value "$size"; then
@@ -1127,6 +1149,21 @@ is_mac(){
   [[ "${1:-}" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]
 }
 
+qemu_img_format_probe(){
+  local path="$1" timeout_s="${2:-3}" actual
+  command -v qemu-img >/dev/null 2>&1 || return 1
+  command -v timeout >/dev/null 2>&1 || return 1
+  [ -f "$path" ] || return 1
+
+  if ! actual="$(timeout "$timeout_s" qemu-img info "$path" 2>/dev/null | awk -F': ' '/^file format:/ {print $2; exit}')"; then
+    return 1
+  fi
+  case "$actual" in
+    raw|qcow2|vdi|vmdk) printf '%s' "$actual"; return 0 ;;
+  esac
+  return 1
+}
+
 preflight_start(){
   local tap mac actual bad=0
   if ! command -v "$QEMU_BIN" >/dev/null 2>&1; then
@@ -1153,12 +1190,14 @@ preflight_start(){
     raw|qcow2|vdi|vmdk) ;;
     *) echo "routerosinstall: unsupported DISK_FORMAT: $DISK_FORMAT" >&2; bad=1 ;;
   esac
-  if command -v qemu-img >/dev/null 2>&1; then
-    actual="$(qemu-img info "$IMAGE_PATH" 2>/dev/null | awk -F': ' '/^file format:/ {print $2; exit}')"
-    if [ -n "$actual" ] && [ "$actual" != "$DISK_FORMAT" ]; then
-      echo "routerosinstall: configured DISK_FORMAT=$DISK_FORMAT, qemu-img reports $actual; using reported format" >&2
-      DISK_FORMAT="$actual"
-    fi
+  actual=""
+  case "${IMAGE_PATH,,}" in
+    *.img|*.raw) ;;
+    *) actual="$(qemu_img_format_probe "$IMAGE_PATH" 3 || true)" ;;
+  esac
+  if [ -n "$actual" ] && [ "$actual" != "$DISK_FORMAT" ]; then
+    echo "routerosinstall: configured DISK_FORMAT=$DISK_FORMAT, qemu-img reports $actual; using reported format" >&2
+    DISK_FORMAT="$actual"
   fi
   for tap in "${taps[@]}"; do
     if ! is_ifname "$tap"; then
