@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-VERSION="2026-05-19-routeros-chr-installer-r6"
+VERSION="2026-05-19-routeros-chr-installer-r7"
 
 INSTALL_CMD="/usr/local/sbin/routerosinstall"
 CONSOLE_CMD="/usr/local/sbin/routeros"
@@ -1429,8 +1429,14 @@ EOF_BRNET
 [Match]
 Name=$iface
 
+[Link]
+RequiredForOnline=no
+ActivationPolicy=up
+
 [Network]
 Bridge=$br
+ConfigureWithoutCarrier=yes
+IgnoreCarrierLoss=yes
 LinkLocalAddressing=no
 IPv6AcceptRA=no
 EOF_PORTNET
@@ -1452,6 +1458,38 @@ write_nm_unmanaged_file(){
 unmanaged-devices=$unmanaged
 EOF_NM
   fi
+}
+
+reload_persistent_network_managers(){
+  local mode="${HOST_NET_MODE:-networkd}"
+  local iface br
+
+  case "$mode" in
+    networkd|both|runtime)
+      if has_cmd networkctl; then
+        networkctl reload 2>/dev/null || true
+        for br in $VM_BRIDGES; do
+          [ -n "$br" ] || continue
+          networkctl reconfigure "$br" 2>/dev/null || true
+        done
+        for iface in $VM_IFACES; do
+          [ -n "$iface" ] || continue
+          [ "$iface" = "none" ] && continue
+          networkctl reconfigure "$iface" 2>/dev/null || true
+        done
+      elif has_cmd systemctl; then
+        systemctl reload systemd-networkd 2>/dev/null || true
+      fi
+      ;;
+  esac
+
+  case "$mode" in
+    nm-unmanaged|both|runtime)
+      if has_cmd systemctl; then
+        systemctl reload NetworkManager 2>/dev/null || systemctl restart NetworkManager 2>/dev/null || true
+      fi
+      ;;
+  esac
 }
 
 write_persistent_network_files(){
@@ -1479,6 +1517,8 @@ write_persistent_network_files(){
       remove_persistent_network_files
       ;;
   esac
+
+  reload_persistent_network_managers
 }
 
 menu_vm_config(){
