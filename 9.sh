@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-VERSION="2026-05-19-routeros-chr-installer"
+VERSION="2026-05-19-routeros-chr-installer-r2"
 
 INSTALL_CMD="/usr/local/sbin/routerosinstall"
 CONSOLE_CMD="/usr/local/sbin/routeros"
@@ -23,14 +23,14 @@ BLUE=$'\033[34m'
 BOLD=$'\033[1m'
 RESET=$'\033[0m'
 
-ok(){ printf '%s\n' "${GREEN}[完成]${RESET} $*"; }
-info(){ printf '%s\n' "${BLUE}[信息]${RESET} $*"; }
-warn(){ printf '%s\n' "${YELLOW}[提醒]${RESET} $*"; }
-err(){ printf '%s\n' "${RED}[错误]${RESET} $*"; }
+ok(){ printf '%s\n' "${GREEN}[完成]${RESET} $*" >&2; }
+info(){ printf '%s\n' "${BLUE}[信息]${RESET} $*" >&2; }
+warn(){ printf '%s\n' "${YELLOW}[提醒]${RESET} $*" >&2; }
+err(){ printf '%s\n' "${RED}[错误]${RESET} $*" >&2; }
 has_cmd(){ command -v "$1" >/dev/null 2>&1; }
 
 pause(){
-  printf '%s' "按回车继续..."
+  printf '%s' "按回车继续..." >&2
   IFS= read -r _ || true
 }
 
@@ -44,9 +44,9 @@ need_root(){
 read_default(){
   local prompt="$1" def="${2:-}" val
   if [ -n "$def" ]; then
-    printf '%s' "$prompt [$def]: "
+    printf '%s' "$prompt [$def]: " >&2
   else
-    printf '%s' "$prompt: "
+    printf '%s' "$prompt: " >&2
   fi
   IFS= read -r val || true
   printf '%s' "${val:-$def}"
@@ -59,7 +59,7 @@ confirm(){
   else
     hint="y/N"
   fi
-  printf '%s' "$prompt [$hint]: "
+  printf '%s' "$prompt [$hint]: " >&2
   IFS= read -r val || true
   val="${val:-$def}"
   case "${val,,}" in
@@ -70,9 +70,9 @@ confirm(){
 
 space_to_continue(){
   local key
-  printf '%s' "按空格继续执行，按其他任意键取消: "
+  printf '%s' "按空格继续执行，按其他任意键取消: " >&2
   IFS= read -rsn1 key || true
-  printf '\n'
+  printf '\n' >&2
   [ "$key" = " " ]
 }
 
