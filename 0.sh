@@ -1160,6 +1160,183 @@ install_all_deps(){
   pause
 }
 
+bytes_human(){
+  if has_cmd numfmt; then
+    numfmt --to=iec --suffix=B "$1" 2>/dev/null || printf '%s bytes\n' "$1"
+  else
+    awk -v b="$1" 'BEGIN{
+      split("B KiB MiB GiB TiB", u, " ");
+      i=1;
+      while (b >= 1024 && i < 5) { b/=1024; i++ }
+      printf "%.1f %s\n", b, u[i]
+    }'
+  fi
+}
+
+parse_size_to_mib(){
+  local raw unit num
+  raw="$(trim "$1")"
+  case "${raw,,}" in
+    ""|full|all|max|全部|最大|扩满)
+      echo full
+      return 0
+      ;;
+  esac
+
+  if [[ "$raw" =~ ^([0-9]+)([KkMmGgTt]?[Bb]?)?$ ]]; then
+    num="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2],,}"
+    case "$unit" in
+      ""|m|mb) echo "$num" ;;
+      g|gb) echo $((num * 1024)) ;;
+      t|tb) echo $((num * 1024 * 1024)) ;;
+      k|kb) echo $(((num + 1023) / 1024)) ;;
+      *) return 1 ;;
+    esac
+    return 0
+  fi
+
+  return 1
+}
+
+resolve_root_block_device(){
+  local root_source root_dev root_majmin
+  root_source="$(findmnt -no SOURCE / | head -n1 || true)"
+  root_dev="$(readlink -f "$root_source" 2>/dev/null || true)"
+
+  if [ -z "$root_dev" ] || [ ! -b "$root_dev" ]; then
+    root_majmin="$(findmnt -no MAJ:MIN / | head -n1 || true)"
+    if [ -n "$root_majmin" ] && [ -e "/dev/block/$root_majmin" ]; then
+      root_dev="$(readlink -f "/dev/block/$root_majmin" 2>/dev/null || true)"
+    fi
+  fi
+
+  [ -n "$root_dev" ] && [ -b "$root_dev" ] || return 1
+  printf '%s\n' "$root_dev"
+}
+
+refresh_partition_table(){
+  local disk="$1"
+  partprobe "$disk" >/dev/null 2>&1 || true
+  partx -u "$disk" >/dev/null 2>&1 || true
+  blockdev --rereadpt "$disk" >/dev/null 2>&1 || true
+  udevadm settle >/dev/null 2>&1 || true
+}
+
+expand_rootfs(){
+  need_root
+  install_packages cloud-guest-utils parted e2fsprogs util-linux || {
+    err "扩容依赖安装失败，请先检查 APT 源和网络。"
+    pause
+    return
+  }
+
+  local root_dev root_fstype disk_name part_num disk current_bytes disk_bytes current_human disk_human
+  local target_input target_value target_mib target_bytes root_start_sector target_sectors target_end_sector disk_sectors max_end_sector add_mode
+
+  root_dev="$(resolve_root_block_device)" || { err "无法识别 / 所在的块设备。"; pause; return; }
+  root_fstype="$(findmnt -no FSTYPE / | head -n1 || true)"
+  case "$root_fstype" in
+    ext2|ext3|ext4) ;;
+    *)
+      err "当前根文件系统是 ${root_fstype:-未知}，此功能只支持 ext2/ext3/ext4 在线扩容。"
+      pause
+      return
+      ;;
+  esac
+
+  disk_name="$(lsblk -no PKNAME "$root_dev" 2>/dev/null | head -n1 | tr -d '[:space:]')"
+  part_num="$(lsblk -no PARTN "$root_dev" 2>/dev/null | head -n1 | tr -d '[:space:]')"
+  if [ -z "$disk_name" ] || [ -z "$part_num" ]; then
+    err "当前根设备 $root_dev 不是普通磁盘分区，暂不自动扩容。"
+    pause
+    return
+  fi
+
+  disk="/dev/$disk_name"
+  [ -b "$disk" ] || { err "父磁盘不存在：$disk"; pause; return; }
+
+  current_bytes="$(blockdev --getsize64 "$root_dev" 2>/dev/null || echo 0)"
+  disk_bytes="$(blockdev --getsize64 "$disk" 2>/dev/null || echo 0)"
+  current_human="$(bytes_human "$current_bytes")"
+  disk_human="$(bytes_human "$disk_bytes")"
+
+  echo
+  info "当前根分区：$root_dev"
+  info "父磁盘：$disk"
+  info "文件系统：$root_fstype"
+  info "当前根分区大小：$current_human"
+  info "父磁盘总容量：$disk_human"
+  echo
+  echo "输入目标 rootfs 分区大小，例如：8192M、8G、16G。"
+  echo "输入 +2G：表示在当前根分区基础上增加 2G。"
+  echo "输入 full / 直接回车：扩展到磁盘可用最大空间。"
+  target_input="$(read_default "目标大小" "full")"
+
+  add_mode=no
+  target_value="$target_input"
+  case "$(trim "$target_input")" in
+    +*)
+      add_mode=yes
+      target_value="${target_input#+}"
+      ;;
+  esac
+
+  target_mib="$(parse_size_to_mib "$target_value")" || {
+    err "大小格式无效：$target_input"
+    pause
+    return
+  }
+
+  if [ "$target_mib" = full ]; then
+    echo
+    warn "将把 $root_dev 扩展到 $disk 的可用最大空间。"
+    confirm "确认继续？" n || { warn "已取消。"; pause; return; }
+    growpart "$disk" "$part_num" || { err "growpart 执行失败。"; pause; return; }
+  else
+    target_bytes=$((target_mib * 1024 * 1024))
+    if [ "$add_mode" = yes ]; then
+      target_bytes=$((current_bytes + target_bytes))
+      target_mib=$(((target_bytes + 1024 * 1024 - 1) / (1024 * 1024)))
+    fi
+    if [ "$target_bytes" -le "$current_bytes" ]; then
+      err "目标大小不能小于或等于当前根分区大小。当前：$current_human"
+      pause
+      return
+    fi
+    root_start_sector="$(parted -sm "$disk" unit s print 2>/dev/null | awk -F: -v p="$part_num" '$1 == p {sub(/s$/, "", $2); print $2; exit}')"
+    disk_sectors="$(blockdev --getsz "$disk" 2>/dev/null || echo 0)"
+    if ! [[ "$root_start_sector" =~ ^[0-9]+$ ]] || ! [[ "$disk_sectors" =~ ^[0-9]+$ ]]; then
+      err "无法读取分区起始位置。"
+      pause
+      return
+    fi
+    target_sectors=$(((target_bytes + 511) / 512))
+    target_end_sector=$((root_start_sector + target_sectors - 1))
+    max_end_sector=$((disk_sectors - 34))
+    if [ "$target_end_sector" -gt "$max_end_sector" ]; then
+      err "目标大小超过磁盘可用空间。磁盘总容量：$disk_human"
+      pause
+      return
+    fi
+
+    echo
+    warn "将把 $root_dev 调整到约 ${target_mib} MiB，然后在线扩容文件系统。"
+    confirm "确认继续？" n || { warn "已取消。"; pause; return; }
+    parted -s "$disk" unit s resizepart "$part_num" "${target_end_sector}s" || {
+      err "parted resizepart 执行失败。"
+      pause
+      return
+    }
+  fi
+
+  refresh_partition_table "$disk"
+  resize2fs "$root_dev" || { err "resize2fs 执行失败。"; pause; return; }
+  ok "rootfs 扩容完成。"
+  df -h / | sed 's/^/  /'
+  pause
+}
+
 backup_menu(){
   while true; do
     clear 2>/dev/null || true
@@ -1209,7 +1386,8 @@ main_menu(){
     echo "11. wlan 设置"
     echo "12. 重新加载 networkd / dnsmasq / nftables"
     echo "13. 一键安装所有网络依赖"
-    echo "14. 设置备份及恢复"
+    echo "14. 一键扩容 rootfs"
+    echo "15. 设置备份及恢复"
     echo "0. 退出"
     echo "============================================================"
     read -r -p "请选择：" choice
@@ -1227,7 +1405,8 @@ main_menu(){
       11) wifi_menu ;;
       12) backup_now 重载 >/dev/null; reload_services; pause ;;
       13) install_all_deps ;;
-      14) backup_menu ;;
+      14) expand_rootfs ;;
+      15) backup_menu ;;
       0) exit 0 ;;
       *) warn "无效选择"; sleep 1 ;;
     esac

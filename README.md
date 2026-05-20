@@ -245,6 +245,7 @@ systemctl restart routeros-chr
 - WLAN 热点模式：配置热点名称、加密、密码，并可加入 `br-lan`。
 - 重新加载 `systemd-networkd`、`dnsmasq`、`nftables`。
 - 一键安装常用网络依赖。
+- 一键扩容 rootfs：安装扩容依赖，支持输入目标大小、增量大小或扩展到磁盘最大可用空间。
 - 备份与恢复配置，保留最近 5 份历史配置。
 
 ## 0.sh 持久化配置
