@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-VERSION="2026-05-20-routeros-chr-installer-r12"
+VERSION="2026-05-20-routeros-chr-installer-r13"
 
 INSTALL_CMD="/usr/local/sbin/routerosinstall"
 CONSOLE_CMD="/usr/local/sbin/routeros"
@@ -11,7 +11,10 @@ PRESET_RSC="$CONFIG_DIR/routeros-preset.rsc"
 LIB_DIR="/usr/local/lib/routerosinstall"
 HOSTNET_SCRIPT="$LIB_DIR/hostnet.sh"
 START_SCRIPT="$LIB_DIR/start-vm.sh"
+QGA_APPLY_SCRIPT="$LIB_DIR/apply-preset-qga.sh"
+APPLY_BOOTSTRAP_SCRIPT="$LIB_DIR/bootstrap-start-apply.sh"
 SERVICE_FILE="/etc/systemd/system/routeros-chr.service"
+BOOTSTRAP_APPLY_SERVICE_FILE="/etc/systemd/system/routeros-chr-bootstrap-apply.service"
 ROLLBACK_SCRIPT="$CONFIG_DIR/last-hostnet-rollback.sh"
 NM_UNMANAGED_CONF="/etc/NetworkManager/conf.d/99-routerosinstall-unmanaged.conf"
 NETWORKD_PREFIX="/etc/systemd/network/00-routerosinstall"
@@ -69,6 +72,13 @@ confirm(){
   esac
 }
 
+yn_default(){
+  case "${1:-}" in
+    1|y|Y|yes|YES|true|TRUE) printf 'y' ;;
+    *) printf 'n' ;;
+  esac
+}
+
 space_to_continue(){
   local key
   printf '%s' "按空格继续执行，按其他任意键取消: " >&2
@@ -115,6 +125,10 @@ is_ros_ifname(){
 
 is_mac(){
   [[ "${1:-}" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]
+}
+
+is_abs_path(){
+  [[ "${1:-}" = /* ]]
 }
 
 is_ipv4(){
@@ -412,6 +426,11 @@ validate_vm_config(){
   NET_QUEUES="$(normalize_uint "virtio-net 队列数" "$NET_QUEUES" "1" 1 16)"
   normalize_host_lan_backconnect
   HOST_LAN_DHCP_ROUTE_METRIC="$(normalize_uint "宿主机 LAN 回接 DHCP route metric" "$HOST_LAN_DHCP_ROUTE_METRIC" "100" 1 9999)"
+  case "${QGA_ENABLED:-1}" in 1|y|yes|true) QGA_ENABLED="1" ;; *) QGA_ENABLED="0" ;; esac
+  case "${AUTO_APPLY_PRESET:-1}" in 1|y|yes|true) AUTO_APPLY_PRESET="1" ;; *) AUTO_APPLY_PRESET="0" ;; esac
+  QGA_SOCK="${QGA_SOCK:-/run/routeros/qga.sock}"
+  is_abs_path "$QGA_SOCK" || { err "QGA socket 必须是绝对路径: $QGA_SOCK"; ok_flag=1; }
+  BOOTSTRAP_ROLLBACK_SECONDS="$(normalize_uint "启动回滚等待秒数" "${BOOTSTRAP_ROLLBACK_SECONDS:-120}" "120" 30 3600)"
   cpu_count="$(nproc 2>/dev/null || echo 0)"
   if is_uint "$cpu_count" && [ "$cpu_count" -gt 0 ] && [ "$VM_CPUS" -gt "$cpu_count" ]; then
     warn "vCPU 数量大于宿主机逻辑 CPU 数，QEMU 可以超分，但不建议生产长期这样跑。"
@@ -554,6 +573,10 @@ save_config(){
     printf 'HOST_LAN_TAP=%q\n' "$HOST_LAN_TAP"
     printf 'HOST_LAN_ROS_IFACE=%q\n' "$HOST_LAN_ROS_IFACE"
     printf 'HOST_LAN_DHCP_ROUTE_METRIC=%q\n' "$HOST_LAN_DHCP_ROUTE_METRIC"
+    printf 'QGA_ENABLED=%q\n' "$QGA_ENABLED"
+    printf 'QGA_SOCK=%q\n' "$QGA_SOCK"
+    printf 'AUTO_APPLY_PRESET=%q\n' "$AUTO_APPLY_PRESET"
+    printf 'BOOTSTRAP_ROLLBACK_SECONDS=%q\n' "$BOOTSTRAP_ROLLBACK_SECONDS"
     printf 'PERSIST_HOST_NET=%q\n' "$PERSIST_HOST_NET"
     printf 'HOST_NET_MODE=%q\n' "$HOST_NET_MODE"
     printf 'ALLOW_DANGEROUS_IFACES=%q\n' "$ALLOW_DANGEROUS_IFACES"
@@ -590,6 +613,10 @@ load_config(){
   HOST_LAN_TAP=""
   HOST_LAN_ROS_IFACE="host-lan"
   HOST_LAN_DHCP_ROUTE_METRIC="100"
+  QGA_ENABLED="1"
+  QGA_SOCK="/run/routeros/qga.sock"
+  AUTO_APPLY_PRESET="1"
+  BOOTSTRAP_ROLLBACK_SECONDS="120"
   PERSIST_HOST_NET="1"
   HOST_NET_MODE=""
   ALLOW_DANGEROUS_IFACES=""
@@ -716,6 +743,7 @@ dependency_report(){
   done <<'EOF_DEPS'
 qemu-system-aarch64|qemu-system-arm
 qemu-img|qemu-utils
+base64|coreutils
 timeout|coreutils
 ip|iproute2
 socat|socat
@@ -838,6 +866,13 @@ show_iface_usage(){
 
 menu_network_check(){
   print_title
+  network_warning_summary
+  printf '\n'
+  if ! confirm "是否展开链路、地址、路由和配置文件明细" "n"; then
+    pause
+    return 0
+  fi
+  printf '\n'
   detect_network_managers
   printf '\n%s\n' "链路概览:"
   ip -br link show 2>/dev/null || true
@@ -855,6 +890,27 @@ menu_network_check(){
   warn "不要把当前 SSH 管理入口选进去，除非你有串口、HDMI 或其他备用管理通道。"
   warn "如果 NetworkManager、netplan 或 systemd-networkd 已经管理这些网口，需要按菜单 3 的持久化选项处理，避免重启后被系统重新抢占。"
   pause
+}
+
+network_warning_summary(){
+  local managers="" default_ifaces="" active_ifaces="" iface
+  systemctl is-active --quiet systemd-networkd 2>/dev/null && managers="${managers:+$managers, }systemd-networkd"
+  systemctl is-active --quiet NetworkManager 2>/dev/null && managers="${managers:+$managers, }NetworkManager"
+  systemctl is-active --quiet networking 2>/dev/null && managers="${managers:+$managers, }ifupdown"
+  systemctl is-active --quiet connman 2>/dev/null && managers="${managers:+$managers, }connman"
+  default_ifaces="$(ip route show default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") print $(i+1)}' | awk 'NF && !seen[$0]++' | xargs 2>/dev/null || true)"
+  while IFS= read -r iface; do
+    [ -n "$iface" ] || continue
+    if ip -o -4 addr show dev "$iface" 2>/dev/null | grep -q . || ip route show dev "$iface" 2>/dev/null | grep -q .; then
+      active_ifaces="${active_ifaces:+$active_ifaces }$iface"
+    fi
+  done < <(physical_ifaces)
+
+  printf '%s\n' "网络提醒:"
+  printf '  %-14s %s\n' "管理器" "${managers:-未发现常见管理器运行}"
+  printf '  %-14s %s\n' "默认路由网口" "${default_ifaces:-无}"
+  printf '  %-14s %s\n' "当前有配置网口" "${active_ifaces:-无}"
+  warn "后续分配给 RouterOS 的物理网口会被接管；如果当前 SSH 走这些口，启动时断开是正常现象。"
 }
 
 guess_disk_format(){
@@ -985,6 +1041,23 @@ choose_image_from_root(){
   esac
 }
 
+wait_for_routeros_image(){
+  while true; do
+    if [ -f /root/routeros.img ]; then
+      IMAGE_PATH="/root/routeros.img"
+      DISK_FORMAT="$(detect_disk_format "$IMAGE_PATH")"
+      ok "检测到 /root/routeros.img"
+      return 0
+    fi
+    warn "未检测到 /root/routeros.img。请把 CHR 镜像放到 /root/routeros.img 后按回车继续检测。"
+    if confirm "是否改为从 /root 下选择其他镜像或 zip 文件" "n"; then
+      choose_image_from_root && return 0
+    else
+      pause
+    fi
+  done
+}
+
 choose_host_ifaces(){
   local -a phys chosen
   local count total_count def iface i macs bridges taps input duplicate ros_names ros_name host_lan_name metric existing_names
@@ -1046,7 +1119,7 @@ choose_host_ifaces(){
   HOST_LAN_TAP=""
   HOST_LAN_ROS_IFACE="${HOST_LAN_ROS_IFACE:-host-lan}"
   HOST_LAN_DHCP_ROUTE_METRIC="${HOST_LAN_DHCP_ROUTE_METRIC:-100}"
-  if confirm "是否额外创建一块宿主机到 RouterOS LAN 的回接虚拟网卡（默认不创建）" "n"; then
+  if confirm "是否额外创建一块宿主机到 RouterOS LAN 的回接虚拟网卡" "${DEFAULT_HOST_LAN_BACKCONNECT:-y}"; then
     HOST_LAN_BACKCONNECT="1"
     while true; do
       host_lan_name="$(read_default "RouterOS 内这块回接口的名称" "$HOST_LAN_ROS_IFACE")"
@@ -1496,6 +1569,8 @@ VM_MEMORY_MB="${VM_MEMORY_MB:-1024}"
 NET_QUEUES="${NET_QUEUES:-1}"
 SERIAL_SOCK="${SERIAL_SOCK:-/run/routeros/serial.sock}"
 MONITOR_SOCK="${MONITOR_SOCK:-/run/routeros/monitor.sock}"
+QGA_ENABLED="${QGA_ENABLED:-1}"
+QGA_SOCK="${QGA_SOCK:-/run/routeros/qga.sock}"
 PID_FILE="${PID_FILE:-/run/routeros/routeros-chr.pid}"
 
 read -r -a taps <<< "${VM_TAPS:-tap-ros1 tap-ros2 tap-ros3}"
@@ -1598,7 +1673,8 @@ preflight_start(){
 }
 
 mkdir -p "$(dirname "$SERIAL_SOCK")"
-rm -f "$SERIAL_SOCK" "$MONITOR_SOCK" "$PID_FILE"
+mkdir -p "$(dirname "$QGA_SOCK")"
+rm -f "$SERIAL_SOCK" "$MONITOR_SOCK" "$QGA_SOCK" "$PID_FILE"
 
 preflight_start
 
@@ -1634,6 +1710,13 @@ done
 
 args+=(-serial "unix:$SERIAL_SOCK,server,nowait")
 args+=(-monitor "unix:$MONITOR_SOCK,server,nowait")
+case "${QGA_ENABLED,,}" in
+  1|y|yes|true)
+    args+=(-chardev "socket,path=$QGA_SOCK,server=on,wait=off,id=qga0")
+    args+=(-device "virtio-serial-pci")
+    args+=(-device "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0")
+    ;;
+esac
 args+=(-pidfile "$PID_FILE" -display none -nographic)
 
 exec "$QEMU_BIN" "${args[@]}"
@@ -1686,6 +1769,201 @@ echo "进入 RouterOS 控制台。退出方式: 按 Ctrl+]。"
 exec socat -,raw,echo=0,escape=0x1d "UNIX-CONNECT:$SERIAL_SOCK"
 EOF_CONSOLE
 
+  atomic_write "$QGA_APPLY_SCRIPT" 0755 <<'EOF_QGA_APPLY'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="/etc/routerosinstall/config.env"
+PRESET_RSC="/etc/routerosinstall/routeros-preset.rsc"
+[ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+QGA_SOCK="${QGA_SOCK:-/run/routeros/qga.sock}"
+WAIT_SECONDS="${1:-120}"
+
+is_uint(){
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+if ! is_uint "$WAIT_SECONDS" || [ "$WAIT_SECONDS" -lt 5 ]; then
+  WAIT_SECONDS=120
+fi
+
+qga_cmd(){
+  local json="$1"
+  timeout 10s socat -T 5 - "UNIX-CONNECT:$QGA_SOCK" 2>/dev/null <<< "$json" | tail -n 1
+}
+
+wait_qga(){
+  local deadline now reply
+  deadline=$(( $(date +%s) + WAIT_SECONDS ))
+  while true; do
+    if [ -S "$QGA_SOCK" ]; then
+      reply="$(qga_cmd '{"execute":"guest-ping"}' || true)"
+      if grep -q '"return"' <<< "$reply"; then
+        return 0
+      fi
+      reply="$(qga_cmd '{"execute":"guest-info"}' || true)"
+      if grep -q '"return"' <<< "$reply"; then
+        return 0
+      fi
+    fi
+    now="$(date +%s)"
+    [ "$now" -ge "$deadline" ] && return 1
+    sleep 2
+  done
+}
+
+json_number_field(){
+  local field="$1" data="$2"
+  sed -n "s/.*\"$field\"[[:space:]]*:[[:space:]]*\\(-\\{0,1\\}[0-9][0-9]*\\).*/\\1/p" <<< "$data" | head -n1
+}
+
+json_string_field(){
+  local field="$1" data="$2"
+  sed -n "s/.*\"$field\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" <<< "$data" | head -n1
+}
+
+decode_base64_field(){
+  local field="$1" data="$2" value
+  value="$(json_string_field "$field" "$data")"
+  [ -n "$value" ] || return 0
+  printf '%s' "$value" | base64 -d 2>/dev/null || true
+}
+
+if [ ! -r "$PRESET_RSC" ]; then
+  echo "routerosinstall: preset file not found: $PRESET_RSC" >&2
+  exit 1
+fi
+if ! command -v socat >/dev/null 2>&1; then
+  echo "routerosinstall: socat not found" >&2
+  exit 1
+fi
+if ! command -v base64 >/dev/null 2>&1; then
+  echo "routerosinstall: base64 not found" >&2
+  exit 1
+fi
+
+if ! wait_qga; then
+  echo "routerosinstall: QEMU guest agent not ready: $QGA_SOCK" >&2
+  exit 1
+fi
+
+input_data="$(base64 -w0 "$PRESET_RSC" 2>/dev/null || base64 "$PRESET_RSC" | tr -d '\n')"
+reply="$(qga_cmd "{\"execute\":\"guest-exec\",\"arguments\":{\"input-data\":\"$input_data\",\"capture-output\":true}}" || true)"
+pid="$(json_number_field pid "$reply")"
+if [ -z "$pid" ]; then
+  echo "routerosinstall: guest-exec did not return pid" >&2
+  echo "$reply" >&2
+  exit 1
+fi
+
+deadline=$(( $(date +%s) + WAIT_SECONDS ))
+while true; do
+  status="$(qga_cmd "{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":$pid}}" || true)"
+  if grep -q '"exited"[[:space:]]*:[[:space:]]*true' <<< "$status"; then
+    exitcode="$(json_number_field exitcode "$status")"
+    if [ "${exitcode:-999}" = "0" ]; then
+      out="$(decode_base64_field out-data "$status")"
+      [ -n "$out" ] && printf '%s\n' "$out"
+      exit 0
+    fi
+    echo "routerosinstall: guest-exec failed, exitcode=${exitcode:-unknown}" >&2
+    decode_base64_field out-data "$status" >&2 || true
+    exit 1
+  fi
+  [ "$(date +%s)" -ge "$deadline" ] && {
+    echo "routerosinstall: guest-exec status timeout" >&2
+    exit 1
+  }
+  sleep 2
+done
+EOF_QGA_APPLY
+
+  atomic_write "$APPLY_BOOTSTRAP_SCRIPT" 0755 <<'EOF_BOOTSTRAP_APPLY'
+#!/usr/bin/env bash
+set -u
+
+CONFIG_FILE="/etc/routerosinstall/config.env"
+[ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+HOSTNET_SCRIPT="/usr/local/lib/routerosinstall/hostnet.sh"
+QGA_APPLY_SCRIPT="/usr/local/lib/routerosinstall/apply-preset-qga.sh"
+LOG_FILE="/var/log/routerosinstall-bootstrap.log"
+OK_FILE="/run/routeros/bootstrap-apply.ok"
+FAIL_FILE="/run/routeros/bootstrap-apply.fail"
+AUTOSTART_ENABLE_FILE="/run/routeros/bootstrap-enable-autostart"
+AUTOSTART_DISABLE_FILE="/run/routeros/bootstrap-disable-autostart"
+
+rollback_seconds="${BOOTSTRAP_ROLLBACK_SECONDS:-120}"
+case "$rollback_seconds" in
+  ''|*[!0-9]*) rollback_seconds=120 ;;
+esac
+[ "$rollback_seconds" -ge 30 ] 2>/dev/null || rollback_seconds=120
+
+mkdir -p /run/routeros "$(dirname "$LOG_FILE")"
+exec >> "$LOG_FILE" 2>&1
+
+echo "===== routerosinstall bootstrap $(date -Is 2>/dev/null || date) ====="
+rm -f "$OK_FILE" "$FAIL_FILE"
+start_ts="$(date +%s)"
+
+rollback_after_failure(){
+  local now elapsed remain
+  now="$(date +%s)"
+  elapsed=$((now - start_ts))
+  remain=$((rollback_seconds - elapsed))
+  [ "$remain" -gt 0 ] && sleep "$remain"
+  if [ ! -f "$OK_FILE" ]; then
+    echo "routerosinstall: bootstrap failed, rolling back RouterOS VM and host network"
+    systemctl stop routeros-chr.service 2>/dev/null || true
+    [ -f "$AUTOSTART_ENABLE_FILE" ] && systemctl disable routeros-chr.service 2>/dev/null || true
+    [ -f "$AUTOSTART_DISABLE_FILE" ] && systemctl disable routeros-chr.service 2>/dev/null || true
+    rm -f "$AUTOSTART_ENABLE_FILE" "$AUTOSTART_DISABLE_FILE" 2>/dev/null || true
+    [ -x "$HOSTNET_SCRIPT" ] && "$HOSTNET_SCRIPT" down 2>/dev/null || true
+    touch "$FAIL_FILE" 2>/dev/null || true
+  fi
+}
+
+apply_autostart_choice(){
+  if [ -f "$AUTOSTART_ENABLE_FILE" ]; then
+    systemctl enable routeros-chr.service 2>/dev/null || true
+  elif [ -f "$AUTOSTART_DISABLE_FILE" ]; then
+    systemctl disable routeros-chr.service 2>/dev/null || true
+  fi
+  rm -f "$AUTOSTART_ENABLE_FILE" "$AUTOSTART_DISABLE_FILE" 2>/dev/null || true
+}
+
+if ! systemctl is-active --quiet routeros-chr.service 2>/dev/null; then
+  echo "routerosinstall: starting routeros-chr.service"
+  if ! systemctl start routeros-chr.service; then
+    echo "routerosinstall: failed to start routeros-chr.service"
+    rollback_after_failure
+    exit 1
+  fi
+fi
+
+case "${AUTO_APPLY_PRESET:-1}:${QGA_ENABLED:-1}" in
+  1:1|y:1|yes:1|true:1)
+    echo "routerosinstall: applying preset through QEMU guest agent"
+    if "$QGA_APPLY_SCRIPT" "$rollback_seconds"; then
+      touch "$OK_FILE" 2>/dev/null || true
+      apply_autostart_choice
+      echo "routerosinstall: preset applied successfully"
+      exit 0
+    fi
+    echo "routerosinstall: preset apply failed"
+    rollback_after_failure
+    exit 1
+    ;;
+  *)
+    touch "$OK_FILE" 2>/dev/null || true
+    apply_autostart_choice
+    echo "routerosinstall: auto preset apply disabled; start finished without bootstrap apply"
+    exit 0
+    ;;
+esac
+EOF_BOOTSTRAP_APPLY
+
   atomic_write "$SERVICE_FILE" 0644 <<EOF_SERVICE
 [Unit]
 Description=RouterOS CHR virtual machine
@@ -1705,6 +1983,22 @@ TimeoutStopSec=30
 [Install]
 WantedBy=multi-user.target
 EOF_SERVICE
+
+  atomic_write "$BOOTSTRAP_APPLY_SERVICE_FILE" 0644 <<EOF_BOOTSTRAP_SERVICE
+[Unit]
+Description=RouterOS CHR bootstrap start and QGA preset apply
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=$APPLY_BOOTSTRAP_SCRIPT
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF_BOOTSTRAP_SERVICE
 
   write_persistent_network_files
   build_preset_rsc || warn "RouterOS 预设置脚本生成失败，请在菜单 4 检查参数。"
@@ -1899,6 +2193,15 @@ menu_vm_config(){
   VM_MEMORY_MB="$(read_default "分配内存 MB" "$VM_MEMORY_MB")"
   NET_QUEUES="$(read_default "virtio-net 队列数，建议 1-4" "$NET_QUEUES")"
   QEMU_BIN="$(read_default "QEMU 可执行文件" "$QEMU_BIN")"
+  if confirm "是否启用 QEMU Guest Agent 无网络预配置" "$(yn_default "${QGA_ENABLED:-1}")"; then
+    QGA_ENABLED="1"
+    AUTO_APPLY_PRESET="1"
+  else
+    QGA_ENABLED="0"
+    AUTO_APPLY_PRESET="0"
+  fi
+  QGA_SOCK="$(read_default "QEMU Guest Agent socket 路径" "$QGA_SOCK")"
+  BOOTSTRAP_ROLLBACK_SECONDS="$(read_default "一键启动失败自动回滚等待秒数" "$BOOTSTRAP_ROLLBACK_SECONDS")"
 
   choose_host_ifaces || { pause; return 1; }
 
@@ -1920,6 +2223,7 @@ menu_vm_config(){
   printf '%s\n' "RouterOS 预设: WAN=$ROS_WAN_IFACE, LAN=${ROS_LAN_PORTS:-无}"
   printf '%s\n' "桥/tap: $VM_BRIDGES / $VM_TAPS"
   printf '%s\n' "宿主机网络持久化: $HOST_NET_MODE"
+  printf '%s\n' "QGA 无网络预配置: QGA=$QGA_ENABLED, 自动导入=$AUTO_APPLY_PRESET, socket=$QGA_SOCK, 回滚等待=${BOOTSTRAP_ROLLBACK_SECONDS}s"
   if [ "${HOST_LAN_BACKCONNECT:-0}" = "1" ]; then
     printf '%s\n' "宿主机 LAN 回接: 开启，RouterOS=$HOST_LAN_ROS_IFACE, 宿主机桥=$HOST_LAN_BRIDGE, DHCP route metric=$HOST_LAN_DHCP_ROUTE_METRIC"
   else
@@ -2068,6 +2372,7 @@ show_routeros_preset_values(){
   else
     printf '  %-18s %s\n' "host backconnect" "disabled"
   fi
+  printf '  %-18s %s\n' "QGA apply" "QGA=$QGA_ENABLED, auto=$AUTO_APPLY_PRESET, rollback=${BOOTSTRAP_ROLLBACK_SECONDS}s"
   printf '  %-18s %s/%s\n' "LAN IP" "$ROS_LAN_IP" "$ROS_LAN_PREFIX"
   printf '  %-18s %s-%s\n' "DHCP pool" "$ROS_DHCP_START" "$ROS_DHCP_END"
   printf '  %-18s %s\n' "DNS" "$ROS_DNS_SERVERS"
@@ -2089,6 +2394,14 @@ edit_routeros_preset(){
   ROS_DHCP_START="$(read_default "DHCP 起始地址" "$ROS_DHCP_START")"
   ROS_DHCP_END="$(read_default "DHCP 结束地址" "$ROS_DHCP_END")"
   ROS_DNS_SERVERS="$(read_default "RouterOS 上游 DNS，逗号分隔" "$ROS_DNS_SERVERS")"
+  if confirm "是否启用 QEMU Guest Agent 自动导入预设置" "$(yn_default "${AUTO_APPLY_PRESET:-1}")"; then
+    QGA_ENABLED="1"
+    AUTO_APPLY_PRESET="1"
+  else
+    AUTO_APPLY_PRESET="0"
+  fi
+  QGA_SOCK="$(read_default "QEMU Guest Agent socket 路径" "$QGA_SOCK")"
+  BOOTSTRAP_ROLLBACK_SECONDS="$(read_default "启动失败自动回滚等待秒数" "$BOOTSTRAP_ROLLBACK_SECONDS")"
   validate_routeros_config || return 1
   save_config
   build_preset_rsc
@@ -2147,6 +2460,20 @@ apply_preset_serial(){
   } | socat -T 60 - "UNIX-CONNECT:$SERIAL_SOCK"
 }
 
+apply_preset_qga(){
+  build_preset_rsc || return 1
+  write_runtime_files
+  if [ "${QGA_ENABLED:-1}" != "1" ]; then
+    err "QGA 未启用，请先在菜单 3 或 4 启用。"
+    return 1
+  fi
+  if ! systemctl is-active --quiet routeros-chr.service 2>/dev/null; then
+    warn "RouterOS 服务未运行，先启动虚拟机。"
+    systemctl start routeros-chr.service || return 1
+  fi
+  "$QGA_APPLY_SCRIPT" "${BOOTSTRAP_ROLLBACK_SECONDS:-120}"
+}
+
 menu_routeros_preset(){
   load_config
   while true; do
@@ -2155,9 +2482,10 @@ menu_routeros_preset(){
     printf '\n'
     printf '%s\n' "1. 修改预设置参数"
     printf '%s\n' "2. 生成/刷新 RouterOS .rsc 预设置脚本"
-    printf '%s\n' "3. 通过 SSH 应用预设置"
-    printf '%s\n' "4. 通过串口 socket 尝试应用预设置"
-    printf '%s\n' "5. 查看预设置脚本"
+    printf '%s\n' "3. 通过 QEMU Guest Agent 无网络应用预设置"
+    printf '%s\n' "4. 通过 SSH 应用预设置"
+    printf '%s\n' "5. 通过串口 socket 尝试应用预设置"
+    printf '%s\n' "6. 查看预设置脚本"
     printf '%s\n' "0. 返回主菜单"
     printf '%s' "请选择: "
     local choice
@@ -2165,9 +2493,10 @@ menu_routeros_preset(){
     case "$choice" in
       1) edit_routeros_preset; pause ;;
       2) build_preset_rsc && ok "已生成 $PRESET_RSC"; pause ;;
-      3) apply_preset_ssh; pause ;;
-      4) apply_preset_serial; pause ;;
-      5) build_preset_rsc && sed -n '1,220p' "$PRESET_RSC"; pause ;;
+      3) apply_preset_qga; pause ;;
+      4) apply_preset_ssh; pause ;;
+      5) apply_preset_serial; pause ;;
+      6) build_preset_rsc && sed -n '1,220p' "$PRESET_RSC"; pause ;;
       0) return ;;
       *) warn "无效选择"; pause ;;
     esac
@@ -2182,9 +2511,132 @@ service_status(){
   fi
 }
 
+guided_vm_config(){
+  local detected_cpu default_cpu edit_preset
+  load_config
+  wait_for_routeros_image || return 1
+
+  detected_cpu="$(nproc 2>/dev/null || echo 4)"
+  default_cpu="$VM_CPUS"
+  [ -n "$default_cpu" ] && [ "$default_cpu" != "0" ] || default_cpu="$detected_cpu"
+  VM_CPUS="$(read_default "分配给 RouterOS 的 vCPU 数量" "$default_cpu")"
+  VM_MEMORY_MB="$(read_default "分配内存 MB" "$VM_MEMORY_MB")"
+  NET_QUEUES="$(read_default "virtio-net 队列数，建议 1-4" "$NET_QUEUES")"
+  QEMU_BIN="$(read_default "QEMU 可执行文件" "$QEMU_BIN")"
+  QGA_ENABLED="1"
+  AUTO_APPLY_PRESET="1"
+  QGA_SOCK="$(read_default "QEMU Guest Agent socket 路径" "$QGA_SOCK")"
+  BOOTSTRAP_ROLLBACK_SECONDS="$(read_default "启动失败自动回滚等待秒数" "$BOOTSTRAP_ROLLBACK_SECONDS")"
+
+  DEFAULT_HOST_LAN_BACKCONNECT="y" choose_host_ifaces || return 1
+  choose_host_net_mode
+  validate_vm_config || return 1
+  DISK_FORMAT="$(detect_disk_format "$IMAGE_PATH")"
+  save_config
+  write_runtime_files
+
+  print_title
+  show_routeros_preset_values
+  printf '\n'
+  if confirm "是否修改以上 RouterOS 预设值；直接回车使用默认值" "n"; then
+    edit_preset="1"
+  else
+    edit_preset="0"
+  fi
+  if [ "$edit_preset" = "1" ]; then
+    edit_routeros_preset || return 1
+  else
+    validate_routeros_config || return 1
+    save_config
+    build_preset_rsc || return 1
+  fi
+}
+
+menu_guided_install(){
+  need_root
+  print_title
+  info "一键安装会依次完成依赖、网络提醒、镜像检测、虚拟机参数、RouterOS 预设、QGA 自动导入和启动。"
+  if confirm "是否先检查并安装缺失依赖" "y"; then
+    install_dependencies || { err "依赖安装失败。"; pause; return 1; }
+  fi
+
+  printf '\n'
+  network_warning_summary
+  pause
+
+  guided_vm_config || { err "引导配置未完成。"; pause; return 1; }
+
+  if confirm "是否设置 RouterOS 开机自启动" "y"; then
+    ENABLE_AUTOSTART_AFTER_INSTALL="1"
+  else
+    ENABLE_AUTOSTART_AFTER_INSTALL="0"
+  fi
+
+  print_title
+  show_install_summary
+  printf '\n'
+  warn "如果当前是从会被接管的管理口 SSH 进入，执行后 SSH 可能立刻断开，属于正常现象。"
+  warn "请把下级设备接到 RouterOS LAN 口，等待获取 ${ROS_LAN_IP%.*}.x 地址后访问 http://$ROS_LAN_IP/ 管理。"
+  warn "若 ${BOOTSTRAP_ROLLBACK_SECONDS}s 内无法获取 IP，可能是启动或 QGA guest-exec 导入失败，脚本会等待回滚后释放宿主机网口。"
+  if ! confirm "是否立即执行并启动 RouterOS" "n"; then
+    warn "已保存配置，但未启动。"
+    pause
+    return 0
+  fi
+
+  if start_routeros_bootstrap "$ENABLE_AUTOSTART_AFTER_INSTALL"; then
+    ok "已提交后台启动任务。"
+    info "查看进度: journalctl -u routeros-chr-bootstrap-apply.service -f"
+    info "查看日志: tail -f /var/log/routerosinstall-bootstrap.log"
+    info "QGA 成功后会保留 RouterOS 运行；失败会在 ${BOOTSTRAP_ROLLBACK_SECONDS}s 内回滚。"
+    [ "$ENABLE_AUTOSTART_AFTER_INSTALL" = "1" ] && info "开机自启动会在 QGA 预设置成功后启用。"
+  else
+    err "后台启动任务提交失败。"
+  fi
+  pause
+}
+
+show_install_summary(){
+  printf '%s\n' "即将使用以下配置:"
+  printf '  %-18s %s (%s)\n' "镜像" "$IMAGE_PATH" "$DISK_FORMAT"
+  printf '  %-18s %s vCPU / %s MB / queues=%s\n' "虚拟机" "$VM_CPUS" "$VM_MEMORY_MB" "$NET_QUEUES"
+  printf '  %-18s %s\n' "宿主机网口" "$VM_IFACES"
+  printf '  %-18s %s\n' "RouterOS 网口" "$ROS_IFACE_NAMES"
+  printf '  %-18s WAN=%s, LAN=%s\n' "预设网络" "$ROS_WAN_IFACE" "$ROS_LAN_PORTS"
+  printf '  %-18s %s/%s, DHCP %s-%s\n' "LAN" "$ROS_LAN_IP" "$ROS_LAN_PREFIX" "$ROS_DHCP_START" "$ROS_DHCP_END"
+  printf '  %-18s %s\n' "宿主机回接" "$([ "${HOST_LAN_BACKCONNECT:-0}" = "1" ] && printf '%s -> %s' "$HOST_LAN_ROS_IFACE" "$HOST_LAN_BRIDGE" || printf '关闭')"
+  printf '  %-18s QGA=%s, auto=%s, rollback=%ss\n' "无网络预配置" "$QGA_ENABLED" "$AUTO_APPLY_PRESET" "$BOOTSTRAP_ROLLBACK_SECONDS"
+  printf '  %-18s %s\n' "开机自启动" "$([ "${ENABLE_AUTOSTART_AFTER_INSTALL:-0}" = "1" ] && printf '开启' || printf '关闭')"
+}
+
+start_routeros_bootstrap(){
+  local enable_autostart="${1:-keep}"
+  write_runtime_files
+  build_preset_rsc || return 1
+  systemctl daemon-reload 2>/dev/null || true
+  mkdir -p /run/routeros
+  rm -f /run/routeros/bootstrap-enable-autostart /run/routeros/bootstrap-disable-autostart 2>/dev/null || true
+  case "$enable_autostart" in
+    1|enable)
+      touch /run/routeros/bootstrap-enable-autostart 2>/dev/null || true
+      ;;
+    0|disable)
+      systemctl disable routeros-chr.service >/dev/null 2>&1 || true
+      touch /run/routeros/bootstrap-disable-autostart 2>/dev/null || true
+      ;;
+    keep|"")
+      ;;
+  esac
+  systemctl reset-failed routeros-chr-bootstrap-apply.service 2>/dev/null || true
+  rm -f /run/routeros/bootstrap-apply.ok /run/routeros/bootstrap-apply.fail 2>/dev/null || true
+  systemctl start --no-block routeros-chr-bootstrap-apply.service
+}
+
 uninstall_vm_service(){
   local keep_config="y" remove_net="y"
   warn "这会停止并删除 RouterOS systemd 服务、hostnet/start 脚本和 routeros 控制台命令。"
+  systemctl stop routeros-chr-bootstrap-apply.service 2>/dev/null || true
+  systemctl disable routeros-chr-bootstrap-apply.service 2>/dev/null || true
   systemctl stop routeros-chr.service 2>/dev/null || true
   systemctl disable routeros-chr.service 2>/dev/null || true
   if [ -x "$HOSTNET_SCRIPT" ]; then
@@ -2195,8 +2647,9 @@ uninstall_vm_service(){
   confirm "是否删除脚本写入的 systemd-networkd/NetworkManager 持久化网口配置" "y" && remove_net="y" || remove_net="n"
 
   rm -f "$SERVICE_FILE" "$CONSOLE_CMD"
+  rm -f "$BOOTSTRAP_APPLY_SERVICE_FILE"
   remove_routeros_dir "$LIB_DIR"
-  rm -f /run/routeros/hostnet.state /run/routeros/serial.sock /run/routeros/monitor.sock /run/routeros/routeros-chr.pid 2>/dev/null || true
+  rm -f /run/routeros/hostnet.state /run/routeros/serial.sock /run/routeros/monitor.sock /run/routeros/qga.sock /run/routeros/routeros-chr.pid /run/routeros/bootstrap-apply.ok /run/routeros/bootstrap-apply.fail /run/routeros/bootstrap-enable-autostart /run/routeros/bootstrap-disable-autostart 2>/dev/null || true
   if [ "$remove_net" = "y" ]; then
     remove_persistent_network_files
   fi
@@ -2231,7 +2684,14 @@ menu_service_manage(){
     case "$choice" in
       1)
         write_runtime_files
-        if systemctl start routeros-chr.service; then
+        if [ "${AUTO_APPLY_PRESET:-1}" = "1" ] && [ "${QGA_ENABLED:-1}" = "1" ]; then
+          if start_routeros_bootstrap "keep"; then
+            ok "已提交 RouterOS 后台启动和 QGA 预设导入任务。"
+            info "查看进度: journalctl -u routeros-chr-bootstrap-apply.service -f"
+          else
+            err "RouterOS 后台启动任务提交失败。"
+          fi
+        elif systemctl start routeros-chr.service; then
           ok "RouterOS 已启动。"
           info "在命令行输入 routeros 可进入 RouterOS 控制台。"
           info "在 RouterOS 控制台中按 Ctrl+] 可退出控制台。"
@@ -2318,6 +2778,7 @@ main_menu(){
   load_config
   while true; do
     print_title
+    printf '%s\n' "0. 一键安装（引导式）"
     printf '%s\n' "1. 依赖安装"
     printf '%s\n' "2. 网络检查"
     printf '%s\n' "3. 虚拟机参数配置"
@@ -2328,6 +2789,7 @@ main_menu(){
     local choice
     IFS= read -r choice || true
     case "$choice" in
+      0) menu_guided_install ;;
       1) menu_dependencies ;;
       2) menu_network_check ;;
       3) menu_vm_config ;;

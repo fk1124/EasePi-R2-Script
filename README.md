@@ -108,11 +108,15 @@ sudo routerosinstall
 
 建议按这个顺序操作：
 
-1. 进入 `1. 依赖安装`，检查并安装 KVM、QEMU、socat、unzip 等依赖。
-2. 进入 `2. 网络检查`，确认当前管理口不要被拿去给 RouterOS 使用。
-3. 进入 `3. 虚拟机参数配置`，选择 `/root/routeros.img`，设置 CPU、内存、virtio-net 网口和宿主机网口。
-4. 进入 `5. RouterOS 启动/关闭/卸载/开机自启动设置`，启动 RouterOS，并按需设置开机自启动。
-5. 进入 `4. RouterOS 预设置`，先确认预设值，再通过 SSH 或串口 socket 应用 WAN、LAN、DHCP、NAT 配置。
+1. 推荐直接进入 `0. 一键安装（引导式）`。
+2. 脚本会先检查并安装 KVM、QEMU、socat、unzip、coreutils 等依赖。
+3. 脚本会给出简要网络提醒，不默认刷屏输出全部链路明细。
+4. 脚本会检测 `/root/routeros.img`；如果没有，会提示把镜像放进去后按回车重新检测。
+5. 按提示配置 CPU、内存、virtio-net 队列、宿主机网口、RouterOS 网口名称和宿主机 LAN 回接。
+6. 确认 RouterOS 预设值，默认不需要修改；确认后通过 QEMU Guest Agent 无网络导入预设置。
+7. 选择是否开机自启动，最后确认是否立即执行并启动 RouterOS。
+
+如果不想走引导式流程，也可以手动按 `1. 依赖安装`、`2. 网络检查`、`3. 虚拟机参数配置`、`4. RouterOS 预设置`、`5. RouterOS 启动/关闭/卸载/开机自启动设置` 的顺序操作。
 
 RK3588 / EasePi-R2 常用配置示例：
 
@@ -125,7 +129,7 @@ virtio-net 队列: 4
 第 2 个 virtio-net: eth1，RouterOS 内重命名为 eth1，作为 LAN
 第 3 个 virtio-net: eth2，RouterOS 内重命名为 eth2，作为 LAN
 第 4 个 virtio-net: eth3，RouterOS 内重命名为 eth3，作为 LAN
-宿主机 LAN 回接虚拟网卡: 默认不创建；需要宿主机也接入 RouterOS LAN 时再开启
+宿主机 LAN 回接虚拟网卡: 一键安装默认创建；手动配置时可按需关闭
 宿主机网络持久化模式: networkd
 ```
 
@@ -139,6 +143,13 @@ RouterOS 归属: br-lan
 ```
 
 这个选项适合让 EasePi-R2 宿主机环境也从虚拟 RouterOS 的 LAN 出口上网、测速或访问 LAN 侧服务。开启后宿主机可能新增或切换默认路由，建议保留串口、HDMI、LTE 管理口或其他备用管理方式。
+
+一键安装默认启用 QEMU Guest Agent 无网络预配置。启动时脚本会先启动 RouterOS，再通过 QGA 的 `guest-exec` 把 `/etc/routerosinstall/routeros-preset.rsc` 导入 RouterOS；这个能力来自 MikroTik CHR 的 [KVM guest agent 支持](https://help.mikrotik.com/docs/spaces/ROS/pages/18350234/Cloud%20Hosted%20Router%20CHR)。如果导入失败，会按设置的回滚等待时间停止虚拟机并释放宿主机网口。常用排查命令：
+
+```bash
+journalctl -u routeros-chr-bootstrap-apply.service -f
+tail -f /var/log/routerosinstall-bootstrap.log
+```
 
 默认 RouterOS 预设置：
 
@@ -211,7 +222,8 @@ systemctl restart routeros-chr
 
 - `9.sh` 当前使用 virtio-net + Linux bridge 方案，不是 PCIe 网卡直通。
 - 被分配给 RouterOS 的宿主机物理网口会被 bridge/tap 接管，宿主机本身不会继续在这些口上直接拿 IP。
-- “宿主机 LAN 回接虚拟网卡”默认关闭；开启后宿主机侧 `br-ros-host` 会尝试通过 RouterOS LAN DHCP 获取地址和默认路由。
+- “宿主机 LAN 回接虚拟网卡”在一键安装里默认开启；开启后宿主机侧 `br-ros-host` 会尝试通过 RouterOS LAN DHCP 获取地址和默认路由，手动配置时可关闭。
+- 一键安装和菜单 5 的启动流程默认使用 QEMU Guest Agent 导入 RouterOS 预设置，不需要先从 RouterOS 里手动执行配置。
 - 不要把当前 SSH 管理入口选给 RouterOS，除非你有串口、HDMI 或其他备用管理方式。
 - 如果脚本发现所选网口当前带有 IP、路由或疑似管理入口，会要求输入 `YES` 后才继续。
 - 脚本会生成尽力回滚脚本：`/etc/routerosinstall/last-hostnet-rollback.sh`。
