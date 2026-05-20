@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-VERSION="2026-05-13-中文网络管理器"
+VERSION="2026-05-20-中文网络管理器-r2"
 BASE_DIR="/etc/easepi-r2-script"
 CONFIG_FILE="$BASE_DIR/网络配置.env"
 BACKUP_DIR="$BASE_DIR/备份"
@@ -198,37 +198,124 @@ install_packages(){
 
 detect_system(){
   OS_ID=""
+  OS_ID_LIKE=""
+  OS_FAMILY=""
   OS_NAME=""
   OS_CODENAME=""
   OS_VERSION=""
+  APT_ARCH=""
   if [ -r /etc/os-release ]; then
     # shellcheck disable=SC1091
     . /etc/os-release
     OS_ID="${ID:-}"
+    OS_ID="${OS_ID,,}"
+    OS_ID_LIKE="${ID_LIKE:-}"
     OS_NAME="${PRETTY_NAME:-$OS_ID}"
     OS_CODENAME="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
     OS_VERSION="${VERSION_ID:-}"
   fi
+  if [ -z "$OS_CODENAME" ] && [ -r /etc/armbian-release ]; then
+    OS_CODENAME="$(awk -F= '/^(DISTRIBUTION_CODENAME|DEBIAN_CODENAME|VERSION_CODENAME)=/ {gsub(/"/,"",$2); print $2; exit}' /etc/armbian-release 2>/dev/null || true)"
+  fi
   if [ -z "$OS_CODENAME" ] && has_cmd lsb_release; then
     OS_CODENAME="$(lsb_release -sc 2>/dev/null || true)"
   fi
+  case "$OS_ID" in
+    ubuntu)
+      OS_FAMILY="ubuntu"
+      ;;
+    debian|raspbian|armbian)
+      OS_FAMILY="debian"
+      ;;
+    *)
+      case " $OS_ID_LIKE " in
+        *" ubuntu "*) OS_FAMILY="ubuntu" ;;
+        *" debian "*) OS_FAMILY="debian" ;;
+      esac
+      ;;
+  esac
+  if [ -z "$OS_FAMILY" ] && [ -r /etc/debian_version ]; then
+    OS_FAMILY="debian"
+  fi
+  if [ -z "$OS_CODENAME" ] && [ -n "$OS_FAMILY" ]; then
+    OS_CODENAME="$(codename_from_version "$OS_FAMILY" "$OS_VERSION")"
+  fi
+  if [ -z "$OS_CODENAME" ] && [ "$OS_FAMILY" = "debian" ] && [ -r /etc/debian_version ]; then
+    OS_CODENAME="$(codename_from_version debian "$(cat /etc/debian_version 2>/dev/null)")"
+  fi
+  APT_ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m 2>/dev/null || echo unknown)"
+}
+
+codename_from_version(){
+  local family="$1" version="${2%%/*}" major
+  version="${version%%-*}"
+  major="${version%%.*}"
+  case "$family:$version" in
+    ubuntu:24.10) echo "oracular"; return ;;
+    ubuntu:24.04*) echo "noble"; return ;;
+    ubuntu:22.04*) echo "jammy"; return ;;
+    ubuntu:20.04*) echo "focal"; return ;;
+    ubuntu:18.04*) echo "bionic"; return ;;
+    ubuntu:16.04*) echo "xenial"; return ;;
+  esac
+  case "$family:$major" in
+    debian:13) echo "trixie" ;;
+    debian:12) echo "bookworm" ;;
+    debian:11) echo "bullseye" ;;
+    debian:10) echo "buster" ;;
+    debian:9) echo "stretch" ;;
+  esac
+}
+
+ubuntu_mirror_path(){
+  case "${APT_ARCH:-}" in
+    amd64|i386) echo "ubuntu" ;;
+    *) echo "ubuntu-ports" ;;
+  esac
+}
+
+debian_components(){
+  case "${OS_CODENAME:-}" in
+    bookworm|trixie|forky|sid|unstable|testing)
+      echo "main contrib non-free non-free-firmware"
+      ;;
+    *)
+      echo "main contrib non-free"
+      ;;
+  esac
+}
+
+debian_security_suite(){
+  case "${OS_CODENAME:-}" in
+    sid|unstable|testing)
+      echo ""
+      ;;
+    buster|stretch)
+      echo "$OS_CODENAME/updates"
+      ;;
+    *)
+      echo "$OS_CODENAME-security"
+      ;;
+  esac
 }
 
 mirror_list(){
-  case "$OS_ID" in
+  local ubuntu_path
+  case "$OS_FAMILY" in
     ubuntu)
-      cat <<'EOF_MIRROR'
-阿里云|https://mirrors.aliyun.com/ubuntu/
-清华大学|https://mirrors.tuna.tsinghua.edu.cn/ubuntu/
-中国科学技术大学|https://mirrors.ustc.edu.cn/ubuntu/
-北京外国语大学|https://mirrors.bfsu.edu.cn/ubuntu/
-南京大学|https://mirror.nju.edu.cn/ubuntu/
-上海交通大学|https://mirror.sjtu.edu.cn/ubuntu/
-腾讯云|https://mirrors.cloud.tencent.com/ubuntu/
-华为云|https://repo.huaweicloud.com/ubuntu/
+      ubuntu_path="$(ubuntu_mirror_path)"
+      cat <<EOF_MIRROR
+阿里云|https://mirrors.aliyun.com/$ubuntu_path/
+清华大学|https://mirrors.tuna.tsinghua.edu.cn/$ubuntu_path/
+中国科学技术大学|https://mirrors.ustc.edu.cn/$ubuntu_path/
+北京外国语大学|https://mirrors.bfsu.edu.cn/$ubuntu_path/
+南京大学|https://mirror.nju.edu.cn/$ubuntu_path/
+上海交通大学|https://mirror.sjtu.edu.cn/$ubuntu_path/
+腾讯云|https://mirrors.cloud.tencent.com/$ubuntu_path/
+华为云|https://repo.huaweicloud.com/$ubuntu_path/
 EOF_MIRROR
       ;;
-    *)
+    debian)
       cat <<'EOF_MIRROR'
 阿里云|https://mirrors.aliyun.com
 清华大学|https://mirrors.tuna.tsinghua.edu.cn
@@ -246,17 +333,16 @@ EOF_MIRROR
 probe_mirror(){
   local url="$1" test_url start end
   [ -n "$OS_CODENAME" ] || { echo 999999; return; }
-  if [ "$OS_ID" = ubuntu ]; then
+  if [ "$OS_FAMILY" = ubuntu ]; then
     test_url="${url%/}/dists/$OS_CODENAME/Release"
   else
     test_url="${url%/}/debian/dists/$OS_CODENAME/Release"
   fi
-  if ! has_cmd curl; then
-    echo 999999
-    return
-  fi
   start="$(date +%s%3N 2>/dev/null || date +%s000)"
-  if curl -fsIL --connect-timeout 3 --max-time 6 "$test_url" >/dev/null 2>&1; then
+  if has_cmd curl && curl -fsIL --connect-timeout 3 --max-time 6 "$test_url" >/dev/null 2>&1; then
+    end="$(date +%s%3N 2>/dev/null || date +%s000)"
+    echo $((end-start))
+  elif has_cmd wget && wget -q --spider --timeout=6 --tries=1 "$test_url" >/dev/null 2>&1; then
     end="$(date +%s%3N 2>/dev/null || date +%s000)"
     echo $((end-start))
   else
@@ -268,6 +354,7 @@ mirror_root(){
   local url="${1%/}"
   case "$url" in
     */ubuntu) echo "${url%/ubuntu}" ;;
+    */ubuntu-ports) echo "${url%/ubuntu-ports}" ;;
     *) echo "$url" ;;
   esac
 }
@@ -316,16 +403,38 @@ rewrite_armbian_source_file(){
   return 0
 }
 
+is_armbian_source_file(){
+  grep -qiE 'apt\.armbian\.com|/armbian(/|$)|armbian\.com/apt' "$1" 2>/dev/null
+}
+
+is_stock_apt_source_file(){
+  grep -qiE 'deb\.debian\.org|security\.debian\.org|ftp\.[^[:space:]/]*debian\.org|archive\.ubuntu\.com|security\.ubuntu\.com|ports\.ubuntu\.com|old-releases\.ubuntu\.com|cn\.archive\.ubuntu\.com' "$1" 2>/dev/null
+}
+
+disable_stock_apt_source_files(){
+  local ts="$1" file disabled
+  [ -d /etc/apt/sources.list.d ] || return 0
+  while IFS= read -r -d '' file; do
+    is_armbian_source_file "$file" && continue
+    if is_stock_apt_source_file "$file"; then
+      disabled="$file.disabled-by-easepi-$ts"
+      mv -f "$file" "$disabled"
+      warn "已停用系统默认源文件：$file -> ${disabled##*/}"
+    fi
+  done < <(find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null)
+}
+
 write_apt_sources(){
-  local name="$1" url="$2" ts armbian_url file found_armbian key_opt
+  local name="$1" url="$2" ts armbian_url file found_armbian key_opt components security_suite
   ts="$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$BASE_DIR/apt备份"
   cp -a /etc/apt/sources.list "$BASE_DIR/apt备份/sources.list.$ts" 2>/dev/null || true
   if [ -d /etc/apt/sources.list.d ]; then
     cp -a /etc/apt/sources.list.d "$BASE_DIR/apt备份/sources.list.d.$ts" 2>/dev/null || true
   fi
+  disable_stock_apt_source_files "$ts"
   armbian_url="$(armbian_mirror_url "$url")"
-  if [ "$OS_ID" = ubuntu ]; then
+  if [ "$OS_FAMILY" = ubuntu ]; then
     cat > /etc/apt/sources.list <<EOF_APT
 deb ${url%/}/ $OS_CODENAME main restricted universe multiverse
 deb ${url%/}/ $OS_CODENAME-updates main restricted universe multiverse
@@ -333,11 +442,17 @@ deb ${url%/}/ $OS_CODENAME-backports main restricted universe multiverse
 deb ${url%/}/ $OS_CODENAME-security main restricted universe multiverse
 EOF_APT
   else
+    components="$(debian_components)"
+    security_suite="$(debian_security_suite)"
     cat > /etc/apt/sources.list <<EOF_APT
-deb ${url%/}/debian/ $OS_CODENAME main contrib non-free non-free-firmware
-deb ${url%/}/debian/ $OS_CODENAME-updates main contrib non-free non-free-firmware
-deb ${url%/}/debian-security/ $OS_CODENAME-security main contrib non-free non-free-firmware
+deb ${url%/}/debian/ $OS_CODENAME $components
 EOF_APT
+    if [ -n "$security_suite" ]; then
+      cat >> /etc/apt/sources.list <<EOF_APT
+deb ${url%/}/debian/ $OS_CODENAME-updates $components
+deb ${url%/}/debian-security/ $security_suite $components
+EOF_APT
+    fi
   fi
   found_armbian=0
   if [ -d /etc/apt/sources.list.d ]; then
@@ -362,62 +477,125 @@ EOF_ARMBIAN
   info "原配置已备份到：$BASE_DIR/apt备份"
 }
 
+apt_process_running(){
+  pgrep -x apt >/dev/null 2>&1 ||
+    pgrep -x apt-get >/dev/null 2>&1 ||
+    pgrep -x aptitude >/dev/null 2>&1 ||
+    pgrep -x dpkg >/dev/null 2>&1
+}
+
+cleanup_apt_after_failure(){
+  warn "APT 更新失败，正在清理索引缓存、partial 目录和过期锁文件。"
+  apt-get clean >/dev/null 2>&1 || true
+  rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/partial/* 2>/dev/null || true
+  mkdir -p /var/lib/apt/lists/partial /var/cache/apt/archives/partial
+  if apt_process_running; then
+    warn "检测到 apt/dpkg 进程仍在运行，已跳过锁文件清理。"
+  else
+    rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend 2>/dev/null || true
+  fi
+}
+
+run_apt_update_checked(){
+  info "正在执行 apt update..."
+  DEBIAN_FRONTEND=noninteractive apt-get update \
+    -o Acquire::Retries=2 \
+    -o Acquire::http::Timeout=15 \
+    -o Acquire::https::Timeout=15
+}
+
 configure_apt_mirror(){
   need_root
   detect_system
   echo
   info "当前系统：${OS_NAME:-未知}"
+  info "APT 类型：${OS_FAMILY:-未知}"
   info "发行代号：${OS_CODENAME:-未知}"
+  info "软件架构：${APT_ARCH:-未知}"
+  if [ -z "$OS_FAMILY" ]; then
+    err "暂不支持当前系统的自动 APT 换源。"
+    pause
+    return
+  fi
   if [ -z "$OS_CODENAME" ]; then
     err "无法识别发行代号，暂不自动改源。"
     pause
     return
   fi
 
-  local name url latency choice best_idx=1 best_latency=999999 idx=0
+  local name url latency choice best_idx=1 best_latency=999999 idx i
   local -a names urls latencies
-  names=()
-  urls=()
-  latencies=()
-  echo
-  info "正在评估国内镜像，不能联网时会按默认优先级选择。"
-  while IFS='|' read -r name url; do
-    [ -n "$name" ] || continue
-    idx=$((idx+1))
-    latency="$(probe_mirror "$url")"
-    names+=("$name")
-    urls+=("$url")
-    latencies+=("$latency")
-    if [ "$latency" -lt "$best_latency" ]; then
-      best_latency="$latency"
-      best_idx="$idx"
+  while true; do
+    names=()
+    urls=()
+    latencies=()
+    best_idx=1
+    best_latency=999999
+    idx=0
+    echo
+    info "正在评估国内镜像，不能联网时会按默认优先级选择。"
+    while IFS='|' read -r name url; do
+      [ -n "$name" ] || continue
+      idx=$((idx+1))
+      latency="$(probe_mirror "$url")"
+      names+=("$name")
+      urls+=("$url")
+      latencies+=("$latency")
+      if [ "$latency" -lt "$best_latency" ]; then
+        best_latency="$latency"
+        best_idx="$idx"
+      fi
+    done < <(mirror_list)
+    if [ "${#names[@]}" -eq 0 ]; then
+      err "没有匹配当前系统类型的镜像列表。"
+      pause
+      return 1
     fi
-  done < <(mirror_list)
-  [ "$best_latency" -eq 999999 ] && best_idx=1
+    [ "$best_latency" -eq 999999 ] && best_idx=1
 
-  echo
-  echo "可选国内加速源："
-  for i in "${!names[@]}"; do
-    idx=$((i+1))
-    if [ "${latencies[$i]}" -eq 999999 ]; then
-      printf '  %d. %s  %s\n' "$idx" "${names[$i]}" "${urls[$i]}"
-    else
-      printf '  %d. %s  %sms  %s\n' "$idx" "${names[$i]}" "${latencies[$i]}" "${urls[$i]}"
+    echo
+    echo "可选国内加速源："
+    for i in "${!names[@]}"; do
+      idx=$((i+1))
+      if [ "${latencies[$i]}" -eq 999999 ]; then
+        printf '  %d. %s  %s\n' "$idx" "${names[$i]}" "${urls[$i]}"
+      else
+        printf '  %d. %s  %sms  %s\n' "$idx" "${names[$i]}" "${latencies[$i]}" "${urls[$i]}"
+      fi
+    done
+    echo "  0. 返回/停止重试"
+    echo
+    read -r -p "请选择数字，直接回车或输入空格使用最优源 [$best_idx]: " choice
+    choice="$(trim "$choice")"
+    [ -z "$choice" ] && choice="$best_idx"
+    if [ "$choice" = "0" ]; then
+      warn "已停止 APT 换源流程；当前配置保持不变或保留最后一次写入的源。"
+      pause
+      return
     fi
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#names[@]}" ]; then
+      warn "选择无效，使用最优源 $best_idx。"
+      choice="$best_idx"
+    fi
+    write_apt_sources "${names[$((choice-1))]}" "${urls[$((choice-1))]}"
+    if ! confirm "是否立即执行 apt update？" y; then
+      pause
+      return
+    fi
+    if run_apt_update_checked; then
+      ok "apt update 成功。"
+      pause
+      return
+    fi
+    err "apt update 失败。"
+    cleanup_apt_after_failure
+    if confirm "是否重新选择一个国内源并重试？" y; then
+      continue
+    fi
+    warn "已保留当前 APT 配置；你可以稍后重新进入本菜单换源。"
+    pause
+    return 1
   done
-  echo
-  read -r -p "请选择数字，直接回车或输入空格使用最优源 [$best_idx]: " choice
-  choice="$(trim "$choice")"
-  [ -z "$choice" ] && choice="$best_idx"
-  if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#names[@]}" ]; then
-    warn "选择无效，使用最优源 $best_idx。"
-    choice="$best_idx"
-  fi
-  write_apt_sources "${names[$((choice-1))]}" "${urls[$((choice-1))]}"
-  if confirm "是否立即执行 apt update？" y; then
-    apt-get update
-  fi
-  pause
 }
 
 configure_ssh_root(){
