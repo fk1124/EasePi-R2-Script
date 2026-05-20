@@ -125,15 +125,27 @@ virtio-net 队列: 4
 第 2 个 virtio-net: eth1，RouterOS 内重命名为 eth1，作为 LAN
 第 3 个 virtio-net: eth2，RouterOS 内重命名为 eth2，作为 LAN
 第 4 个 virtio-net: eth3，RouterOS 内重命名为 eth3，作为 LAN
+宿主机 LAN 回接虚拟网卡: 默认不创建；需要宿主机也接入 RouterOS LAN 时再开启
 宿主机网络持久化模式: networkd
 ```
+
+如果在第 3 项里开启“宿主机到 RouterOS LAN 的回接虚拟网卡”，脚本会额外创建一块 virtio-net：
+
+```text
+RouterOS 内网口名: host-lan
+RouterOS 归属: br-lan
+宿主机侧桥: br-ros-host
+宿主机获取地址方式: 通过 RouterOS LAN DHCP 获取 10.10.10.x
+```
+
+这个选项适合让 EasePi-R2 宿主机环境也从虚拟 RouterOS 的 LAN 出口上网、测速或访问 LAN 侧服务。开启后宿主机可能新增或切换默认路由，建议保留串口、HDMI、LTE 管理口或其他备用管理方式。
 
 默认 RouterOS 预设置：
 
 ```text
 WAN: eth0，DHCP 获取上级地址
 LAN bridge: br-lan
-LAN ports: eth1 eth2 eth3
+LAN ports: eth1 eth2 eth3；开启宿主机 LAN 回接时会额外加入 host-lan
 LAN IP: 10.10.10.1/24
 DHCP: 10.10.10.100-10.10.10.200
 NAT: LAN 出口 masquerade 到 WAN
@@ -199,6 +211,7 @@ systemctl restart routeros-chr
 
 - `9.sh` 当前使用 virtio-net + Linux bridge 方案，不是 PCIe 网卡直通。
 - 被分配给 RouterOS 的宿主机物理网口会被 bridge/tap 接管，宿主机本身不会继续在这些口上直接拿 IP。
+- “宿主机 LAN 回接虚拟网卡”默认关闭；开启后宿主机侧 `br-ros-host` 会尝试通过 RouterOS LAN DHCP 获取地址和默认路由。
 - 不要把当前 SSH 管理入口选给 RouterOS，除非你有串口、HDMI 或其他备用管理方式。
 - 如果脚本发现所选网口当前带有 IP、路由或疑似管理入口，会要求输入 `YES` 后才继续。
 - 脚本会生成尽力回滚脚本：`/etc/routerosinstall/last-hostnet-rollback.sh`。

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-VERSION="2026-05-20-routeros-chr-installer-r11"
+VERSION="2026-05-20-routeros-chr-installer-r12"
 
 INSTALL_CMD="/usr/local/sbin/routerosinstall"
 CONSOLE_CMD="/usr/local/sbin/routeros"
@@ -205,6 +205,51 @@ join_words(){
   printf '%s' "$out"
 }
 
+word_in_string(){
+  local needle="$1" words="${2:-}" item
+  for item in $words; do
+    [ "$item" = "$needle" ] && return 0
+  done
+  return 1
+}
+
+append_word_unique(){
+  local list="$1" word="$2"
+  if [ -z "$word" ] || word_in_string "$word" "$list"; then
+    printf '%s' "$list"
+  else
+    printf '%s' "${list:+$list }$word"
+  fi
+}
+
+first_duplicate_word(){
+  local list="${1:-}" seen="" item
+  for item in $list; do
+    if word_in_string "$item" "$seen"; then
+      printf '%s' "$item"
+      return 0
+    fi
+    seen="${seen:+$seen }$item"
+  done
+  return 1
+}
+
+normalize_host_lan_backconnect(){
+  if [ "${HOST_LAN_BACKCONNECT:-0}" = "1" ]; then
+    HOST_LAN_BACKCONNECT="1"
+    HOST_LAN_BRIDGE="${HOST_LAN_BRIDGE:-br-ros-host}"
+    HOST_LAN_TAP="${HOST_LAN_TAP:-tap-ros-host}"
+    HOST_LAN_ROS_IFACE="${HOST_LAN_ROS_IFACE:-host-lan}"
+    HOST_LAN_DHCP_ROUTE_METRIC="${HOST_LAN_DHCP_ROUTE_METRIC:-100}"
+  else
+    HOST_LAN_BACKCONNECT="0"
+    HOST_LAN_BRIDGE=""
+    HOST_LAN_TAP=""
+    HOST_LAN_ROS_IFACE="${HOST_LAN_ROS_IFACE:-host-lan}"
+    HOST_LAN_DHCP_ROUTE_METRIC="${HOST_LAN_DHCP_ROUTE_METRIC:-100}"
+  fi
+}
+
 default_ros_name_for_slot(){
   local index="$1" host_iface="${2:-}"
   if [ -n "$host_iface" ] && [ "$host_iface" != "none" ] && is_ros_ifname "$host_iface"; then
@@ -215,9 +260,17 @@ default_ros_name_for_slot(){
 }
 
 derive_ros_iface_names(){
-  local idx=1 iface name out=""
+  local idx=1 zero iface name out=""
+  local -a bridges taps
+  read -r -a bridges <<< "${VM_BRIDGES:-}"
+  read -r -a taps <<< "${VM_TAPS:-}"
   for iface in $VM_IFACES; do
-    name="$(default_ros_name_for_slot "$idx" "$iface")"
+    zero=$((idx - 1))
+    if [ "${HOST_LAN_BACKCONNECT:-0}" = "1" ] && { [ "${bridges[$zero]:-}" = "${HOST_LAN_BRIDGE:-}" ] || [ "${taps[$zero]:-}" = "${HOST_LAN_TAP:-}" ]; }; then
+      name="${HOST_LAN_ROS_IFACE:-host-lan}"
+    else
+      name="$(default_ros_name_for_slot "$idx" "$iface")"
+    fi
     out="${out:+$out }$name"
     idx=$((idx + 1))
   done
@@ -233,6 +286,9 @@ sync_routeros_defaults_from_vm(){
   ROS_IFACE_NAMES="$names"
   ROS_WAN_IFACE="$(first_word "$ROS_IFACE_NAMES")"
   ROS_LAN_PORTS="$(list_without_first $ROS_IFACE_NAMES)"
+  if [ "${HOST_LAN_BACKCONNECT:-0}" = "1" ] && word_in_string "${HOST_LAN_ROS_IFACE:-}" "$ROS_IFACE_NAMES"; then
+    ROS_LAN_PORTS="$(append_word_unique "$ROS_LAN_PORTS" "$HOST_LAN_ROS_IFACE")"
+  fi
 }
 
 management_ifaces(){
@@ -350,10 +406,12 @@ detect_disk_format(){
 }
 
 validate_vm_config(){
-  local ok_flag=0 count_if count_br count_tap count_mac item cpu_count
+  local ok_flag=0 count_if count_br count_tap count_mac item cpu_count duplicate
   VM_CPUS="$(normalize_uint "vCPU 数量" "$VM_CPUS" "$(nproc 2>/dev/null || echo 4)" 1 256)"
   VM_MEMORY_MB="$(normalize_uint "内存 MB" "$VM_MEMORY_MB" "1024" 128 262144)"
   NET_QUEUES="$(normalize_uint "virtio-net 队列数" "$NET_QUEUES" "1" 1 16)"
+  normalize_host_lan_backconnect
+  HOST_LAN_DHCP_ROUTE_METRIC="$(normalize_uint "宿主机 LAN 回接 DHCP route metric" "$HOST_LAN_DHCP_ROUTE_METRIC" "100" 1 9999)"
   cpu_count="$(nproc 2>/dev/null || echo 0)"
   if is_uint "$cpu_count" && [ "$cpu_count" -gt 0 ] && [ "$VM_CPUS" -gt "$cpu_count" ]; then
     warn "vCPU 数量大于宿主机逻辑 CPU 数，QEMU 可以超分，但不建议生产长期这样跑。"
@@ -391,6 +449,14 @@ validate_vm_config(){
   done
   validate_name_list "桥名称" is_ifname "$VM_BRIDGES" || ok_flag=1
   validate_name_list "tap 名称" is_ifname "$VM_TAPS" || ok_flag=1
+  if duplicate="$(first_duplicate_word "$VM_BRIDGES")"; then
+    err "桥名称重复: $duplicate"
+    ok_flag=1
+  fi
+  if duplicate="$(first_duplicate_word "$VM_TAPS")"; then
+    err "tap 名称重复: $duplicate"
+    ok_flag=1
+  fi
   for item in $VM_MACS; do
     is_mac "$item" || { err "MAC 地址非法: $item"; ok_flag=1; }
   done
@@ -398,11 +464,24 @@ validate_vm_config(){
     ROS_IFACE_NAMES="$(derive_ros_iface_names)"
   fi
   validate_name_list "RouterOS 网口名称列表" is_ros_ifname "$ROS_IFACE_NAMES" || ok_flag=1
+  if duplicate="$(first_duplicate_word "$ROS_IFACE_NAMES")"; then
+    err "RouterOS 网口名称重复: $duplicate"
+    ok_flag=1
+  fi
+  if [ "$HOST_LAN_BACKCONNECT" = "1" ]; then
+    is_ifname "$HOST_LAN_BRIDGE" || { err "宿主机 LAN 回接桥名称非法: $HOST_LAN_BRIDGE"; ok_flag=1; }
+    is_ifname "$HOST_LAN_TAP" || { err "宿主机 LAN 回接 tap 名称非法: $HOST_LAN_TAP"; ok_flag=1; }
+    is_ros_ifname "$HOST_LAN_ROS_IFACE" || { err "宿主机 LAN 回接 RouterOS 网口名称非法: $HOST_LAN_ROS_IFACE"; ok_flag=1; }
+    word_in_string "$HOST_LAN_BRIDGE" "$VM_BRIDGES" || { err "宿主机 LAN 回接桥不在 VM_BRIDGES 中: $HOST_LAN_BRIDGE"; ok_flag=1; }
+    word_in_string "$HOST_LAN_TAP" "$VM_TAPS" || { err "宿主机 LAN 回接 tap 不在 VM_TAPS 中: $HOST_LAN_TAP"; ok_flag=1; }
+    word_in_string "$HOST_LAN_ROS_IFACE" "$ROS_IFACE_NAMES" || { err "宿主机 LAN 回接 RouterOS 网口不在名称列表中: $HOST_LAN_ROS_IFACE"; ok_flag=1; }
+  fi
   [ "$ok_flag" -eq 0 ]
 }
 
 validate_routeros_config(){
   local ok_flag=0 dns dns_trim start_int end_int lan_net start_net end_net item ros_count vm_count _dns_list
+  normalize_host_lan_backconnect
   [ -n "${ROS_IDENTITY:-}" ] || { err "RouterOS identity 不能为空。"; ok_flag=1; }
   is_ros_ifname "$ROS_WAN_IFACE" || { err "WAN 口名称非法: $ROS_WAN_IFACE"; ok_flag=1; }
   is_ros_ifname "$ROS_LAN_BRIDGE" || { err "LAN bridge 名称非法: $ROS_LAN_BRIDGE"; ok_flag=1; }
@@ -419,6 +498,16 @@ validate_routeros_config(){
   if [ "$vm_count" -gt 0 ] && [ "$ros_count" -ne "$vm_count" ]; then
     err "RouterOS 网口名称数量必须和 virtio-net 数量一致: RouterOS=$ros_count, virtio-net=$vm_count"
     ok_flag=1
+  fi
+  if [ "$HOST_LAN_BACKCONNECT" = "1" ]; then
+    if ! word_in_string "$HOST_LAN_ROS_IFACE" "${ROS_IFACE_NAMES:-}"; then
+      err "宿主机 LAN 回接口 $HOST_LAN_ROS_IFACE 不在 RouterOS 网口名称列表中。"
+      ok_flag=1
+    fi
+    if ! word_in_string "$HOST_LAN_ROS_IFACE" "${ROS_LAN_PORTS:-}"; then
+      err "宿主机 LAN 回接口 $HOST_LAN_ROS_IFACE 必须加入 LAN 口列表，否则宿主机无法从 RouterOS LAN DHCP 获取地址。"
+      ok_flag=1
+    fi
   fi
   is_ipv4 "$ROS_LAN_IP" || { err "LAN IP 非法: $ROS_LAN_IP"; ok_flag=1; }
   is_prefix "$ROS_LAN_PREFIX" || { err "LAN 掩码前缀非法: $ROS_LAN_PREFIX"; ok_flag=1; }
@@ -460,6 +549,11 @@ save_config(){
     printf 'VM_TAPS=%q\n' "$VM_TAPS"
     printf 'VM_MACS=%q\n' "$VM_MACS"
     printf 'ROS_IFACE_NAMES=%q\n' "$ROS_IFACE_NAMES"
+    printf 'HOST_LAN_BACKCONNECT=%q\n' "$HOST_LAN_BACKCONNECT"
+    printf 'HOST_LAN_BRIDGE=%q\n' "$HOST_LAN_BRIDGE"
+    printf 'HOST_LAN_TAP=%q\n' "$HOST_LAN_TAP"
+    printf 'HOST_LAN_ROS_IFACE=%q\n' "$HOST_LAN_ROS_IFACE"
+    printf 'HOST_LAN_DHCP_ROUTE_METRIC=%q\n' "$HOST_LAN_DHCP_ROUTE_METRIC"
     printf 'PERSIST_HOST_NET=%q\n' "$PERSIST_HOST_NET"
     printf 'HOST_NET_MODE=%q\n' "$HOST_NET_MODE"
     printf 'ALLOW_DANGEROUS_IFACES=%q\n' "$ALLOW_DANGEROUS_IFACES"
@@ -491,6 +585,11 @@ load_config(){
   VM_TAPS="tap-ros1 tap-ros2 tap-ros3 tap-ros4"
   VM_MACS="52:54:00:21:00:01 52:54:00:21:00:02 52:54:00:21:00:03 52:54:00:21:00:04"
   ROS_IFACE_NAMES=""
+  HOST_LAN_BACKCONNECT="0"
+  HOST_LAN_BRIDGE=""
+  HOST_LAN_TAP=""
+  HOST_LAN_ROS_IFACE="host-lan"
+  HOST_LAN_DHCP_ROUTE_METRIC="100"
   PERSIST_HOST_NET="1"
   HOST_NET_MODE=""
   ALLOW_DANGEROUS_IFACES=""
@@ -519,9 +618,10 @@ load_config(){
       HOST_NET_MODE="runtime"
     fi
   fi
+  normalize_host_lan_backconnect
   if [ -z "${ROS_IFACE_NAMES:-}" ] || [ "$(wc -w <<< "${ROS_IFACE_NAMES:-}")" -ne "$(wc -w <<< "${VM_IFACES:-}")" ]; then
     ROS_IFACE_NAMES="$(derive_ros_iface_names)"
-    if [ "$config_has_ros_iface_names" -eq 0 ] || [[ "${ROS_WAN_IFACE:-}" =~ ^ether[0-9]+$ ]]; then
+    if [ "$config_has_ros_iface_names" -eq 0 ] || [ -z "${ROS_WAN_IFACE:-}" ] || [ -z "${ROS_LAN_PORTS:-}" ] || [[ "${ROS_WAN_IFACE:-}" =~ ^ether[0-9]+$ ]]; then
       sync_routeros_defaults_from_vm
     fi
   fi
@@ -887,7 +987,7 @@ choose_image_from_root(){
 
 choose_host_ifaces(){
   local -a phys chosen
-  local count def iface i macs bridges taps input duplicate ros_names ros_name
+  local count total_count def iface i macs bridges taps input duplicate ros_names ros_name host_lan_name metric existing_names
   phys=()
   chosen=()
   while IFS= read -r iface; do
@@ -941,13 +1041,53 @@ choose_host_ifaces(){
     done
   done
 
+  HOST_LAN_BACKCONNECT="0"
+  HOST_LAN_BRIDGE=""
+  HOST_LAN_TAP=""
+  HOST_LAN_ROS_IFACE="${HOST_LAN_ROS_IFACE:-host-lan}"
+  HOST_LAN_DHCP_ROUTE_METRIC="${HOST_LAN_DHCP_ROUTE_METRIC:-100}"
+  if confirm "是否额外创建一块宿主机到 RouterOS LAN 的回接虚拟网卡（默认不创建）" "n"; then
+    HOST_LAN_BACKCONNECT="1"
+    while true; do
+      host_lan_name="$(read_default "RouterOS 内这块回接口的名称" "$HOST_LAN_ROS_IFACE")"
+      host_lan_name="$(trim "$host_lan_name")"
+      [ -n "$host_lan_name" ] || host_lan_name="host-lan"
+      if ! is_ros_ifname "$host_lan_name"; then
+        warn "RouterOS 网口名称非法，请重新输入。"
+        continue
+      fi
+      existing_names=""
+      for ((i=1; i<=count; i++)); do
+        ros_name="$(default_ros_name_for_slot "$i" "${chosen[$((i-1))]}")"
+        existing_names="${existing_names:+$existing_names }$ros_name"
+      done
+      if word_in_string "$host_lan_name" "$existing_names"; then
+        warn "RouterOS 网口名称 $host_lan_name 已被前面的 virtio-net 使用，请换一个。"
+        continue
+      fi
+      HOST_LAN_ROS_IFACE="$host_lan_name"
+      break
+    done
+    metric="$(read_default "宿主机通过回接口 DHCP 获取默认路由的 metric" "$HOST_LAN_DHCP_ROUTE_METRIC")"
+    HOST_LAN_DHCP_ROUTE_METRIC="$(normalize_uint "宿主机 LAN 回接 DHCP route metric" "$metric" "100" 1 9999)"
+    HOST_LAN_BRIDGE="br-ros-host"
+    HOST_LAN_TAP="tap-ros-host"
+    chosen+=("none")
+  fi
+
   VM_IFACES="${chosen[*]}"
+  total_count="${#chosen[@]}"
   bridges=()
   taps=()
   macs=()
-  for ((i=1; i<=count; i++)); do
-    bridges+=("br-ros$i")
-    taps+=("tap-ros$i")
+  for ((i=1; i<=total_count; i++)); do
+    if [ "$HOST_LAN_BACKCONNECT" = "1" ] && [ "$i" -eq "$total_count" ]; then
+      bridges+=("$HOST_LAN_BRIDGE")
+      taps+=("$HOST_LAN_TAP")
+    else
+      bridges+=("br-ros$i")
+      taps+=("tap-ros$i")
+    fi
     macs+=("52:54:00:21:00:$(printf '%02x' "$i")")
   done
   VM_BRIDGES="${bridges[*]}"
@@ -955,8 +1095,12 @@ choose_host_ifaces(){
   VM_MACS="${macs[*]}"
 
   ros_names=()
-  for ((i=1; i<=count; i++)); do
-    ros_name="$(default_ros_name_for_slot "$i" "${chosen[$((i-1))]}")"
+  for ((i=1; i<=total_count; i++)); do
+    if [ "$HOST_LAN_BACKCONNECT" = "1" ] && [ "$i" -eq "$total_count" ]; then
+      ros_name="$HOST_LAN_ROS_IFACE"
+    else
+      ros_name="$(default_ros_name_for_slot "$i" "${chosen[$((i-1))]}")"
+    fi
     ros_names+=("$ros_name")
   done
   ROS_IFACE_NAMES="$(join_words "${ros_names[@]}")"
@@ -1034,6 +1178,9 @@ read -r -a ifaces <<< "${VM_IFACES:-}"
 read -r -a bridges <<< "${VM_BRIDGES:-}"
 read -r -a taps <<< "${VM_TAPS:-}"
 queues="${NET_QUEUES:-1}"
+host_lan_enabled="${HOST_LAN_BACKCONNECT:-0}"
+host_lan_bridge="${HOST_LAN_BRIDGE:-}"
+host_lan_metric="${HOST_LAN_DHCP_ROUTE_METRIC:-100}"
 
 is_uint(){
   [[ "${1:-}" =~ ^[0-9]+$ ]]
@@ -1164,6 +1311,98 @@ tap_created_by_us(){
   grep -qxF "tap $tap created" "$STATE_FILE" 2>/dev/null
 }
 
+bridge_is_host_lan(){
+  local br="$1"
+  [ "$host_lan_enabled" = "1" ] && [ -n "$host_lan_bridge" ] && [ "$br" = "$host_lan_bridge" ]
+}
+
+runtime_networkd_file(){
+  local br="$1"
+  printf '/run/systemd/network/00-routerosinstall-%s.network' "$br"
+}
+
+start_networkd_dhcp(){
+  local br="$1" file
+  command -v networkctl >/dev/null 2>&1 || return 1
+  systemctl is-active --quiet systemd-networkd.service 2>/dev/null || return 1
+  mkdir -p /run/systemd/network
+  file="$(runtime_networkd_file "$br")"
+  cat > "$file" <<EOF_RUNTIME_NETWORKD
+[Match]
+Name=$br
+
+[Link]
+RequiredForOnline=no
+
+[Network]
+DHCP=ipv4
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+
+[DHCPv4]
+RouteMetric=$host_lan_metric
+UseDNS=true
+UseRoutes=true
+EOF_RUNTIME_NETWORKD
+  networkctl reload 2>/dev/null || systemctl reload systemd-networkd.service 2>/dev/null || true
+  networkctl reconfigure "$br" 2>/dev/null || true
+  return 0
+}
+
+start_dhcp_client(){
+  local br="$1"
+  if command -v dhclient >/dev/null 2>&1; then
+    dhclient -4 -nw -pf "/run/routeros/dhclient-$br.pid" -lf "/run/routeros/dhclient-$br.leases" "$br" >/dev/null 2>&1 || return 1
+    return 0
+  fi
+  if command -v dhcpcd >/dev/null 2>&1; then
+    dhcpcd -4 -b "$br" >/dev/null 2>&1 || return 1
+    return 0
+  fi
+  if command -v udhcpc >/dev/null 2>&1; then
+    udhcpc -i "$br" -p "/run/routeros/udhcpc-$br.pid" -b >/dev/null 2>&1 || return 1
+    return 0
+  fi
+  return 1
+}
+
+start_host_lan_dhcp(){
+  local br="$1"
+  ip link set "$br" up 2>/dev/null || true
+  if start_networkd_dhcp "$br"; then
+    echo "routerosinstall: host LAN backconnect DHCP via systemd-networkd on $br" >&2
+    return 0
+  fi
+  if start_dhcp_client "$br"; then
+    echo "routerosinstall: host LAN backconnect DHCP client started on $br" >&2
+    return 0
+  fi
+  echo "routerosinstall: host LAN backconnect enabled on $br, but no DHCP manager/client was available" >&2
+  return 1
+}
+
+stop_host_lan_dhcp(){
+  local br="$1" pid file
+  file="$(runtime_networkd_file "$br")"
+  rm -f "$file" 2>/dev/null || true
+  if command -v networkctl >/dev/null 2>&1; then
+    networkctl reload 2>/dev/null || true
+  fi
+  if [ -f "/run/routeros/dhclient-$br.pid" ]; then
+    pid="$(cat "/run/routeros/dhclient-$br.pid" 2>/dev/null || true)"
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    rm -f "/run/routeros/dhclient-$br.pid" "/run/routeros/dhclient-$br.leases" 2>/dev/null || true
+  fi
+  if [ -f "/run/routeros/udhcpc-$br.pid" ]; then
+    pid="$(cat "/run/routeros/udhcpc-$br.pid" 2>/dev/null || true)"
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    rm -f "/run/routeros/udhcpc-$br.pid" 2>/dev/null || true
+  fi
+  if command -v dhcpcd >/dev/null 2>&1; then
+    dhcpcd -k "$br" >/dev/null 2>&1 || true
+  fi
+}
+
 case "$ACTION" in
   up)
     preflight_up
@@ -1205,6 +1444,9 @@ case "$ACTION" in
           echo "routerosinstall: host iface $iface not found" >&2
         fi
       fi
+      if bridge_is_host_lan "$br"; then
+        start_host_lan_dhcp "$br" || true
+      fi
     done
     ;;
   down)
@@ -1212,6 +1454,9 @@ case "$ACTION" in
       br="${bridges[$i]}"
       tap="${taps[$i]:-}"
       iface="${ifaces[$i]:-none}"
+      if bridge_is_host_lan "$br"; then
+        stop_host_lan_dhcp "$br"
+      fi
       if [ -n "$iface" ] && [ "$iface" != "none" ] && ip link show "$iface" >/dev/null 2>&1; then
         ip link set "$iface" nomaster 2>/dev/null || true
       fi
@@ -1488,7 +1733,8 @@ remove_routeros_dir(){
 
 write_networkd_files(){
   local -a ifaces bridges
-  local i iface br
+  local i iface br metric
+  metric="$(normalize_uint "宿主机 LAN 回接 DHCP route metric" "${HOST_LAN_DHCP_ROUTE_METRIC:-100}" "100" 1 9999)"
   read -r -a ifaces <<< "$VM_IFACES"
   read -r -a bridges <<< "$VM_BRIDGES"
   mkdir -p /etc/systemd/network
@@ -1504,14 +1750,37 @@ write_networkd_files(){
 Name=$br
 Kind=bridge
 EOF_NETDEV
-    atomic_write "$NETWORKD_PREFIX-$br.network" 0644 <<EOF_BRNET
+    if [ "${HOST_LAN_BACKCONNECT:-0}" = "1" ] && [ "$br" = "${HOST_LAN_BRIDGE:-}" ]; then
+      atomic_write "$NETWORKD_PREFIX-$br.network" 0644 <<EOF_BRNET_DHCP
 [Match]
 Name=$br
+
+[Link]
+RequiredForOnline=no
+
+[Network]
+DHCP=ipv4
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+
+[DHCPv4]
+RouteMetric=$metric
+UseDNS=true
+UseRoutes=true
+EOF_BRNET_DHCP
+    else
+      atomic_write "$NETWORKD_PREFIX-$br.network" 0644 <<EOF_BRNET
+[Match]
+Name=$br
+
+[Link]
+RequiredForOnline=no
 
 [Network]
 LinkLocalAddressing=no
 IPv6AcceptRA=no
 EOF_BRNET
+    fi
     if [ -n "$iface" ] && [ "$iface" != "none" ]; then
       atomic_write "$NETWORKD_PREFIX-$iface.network" 0644 <<EOF_PORTNET
 [Match]
@@ -1533,12 +1802,14 @@ EOF_PORTNET
 }
 
 write_nm_unmanaged_file(){
-  local iface unmanaged=""
+  local item unmanaged="" unmanaged_words=""
   mkdir -p /etc/NetworkManager/conf.d
-  for iface in $VM_IFACES; do
-    [ -n "$iface" ] || continue
-    [ "$iface" = "none" ] && continue
-    unmanaged="${unmanaged:+$unmanaged; }interface-name:$iface"
+  for item in $VM_IFACES $VM_BRIDGES $VM_TAPS; do
+    [ -n "$item" ] || continue
+    [ "$item" = "none" ] && continue
+    word_in_string "$item" "$unmanaged_words" && continue
+    unmanaged_words="${unmanaged_words:+$unmanaged_words }$item"
+    unmanaged="${unmanaged:+$unmanaged; }interface-name:$item"
   done
   if [ -n "$unmanaged" ]; then
     atomic_write "$NM_UNMANAGED_CONF" 0644 <<EOF_NM
@@ -1649,6 +1920,11 @@ menu_vm_config(){
   printf '%s\n' "RouterOS 预设: WAN=$ROS_WAN_IFACE, LAN=${ROS_LAN_PORTS:-无}"
   printf '%s\n' "桥/tap: $VM_BRIDGES / $VM_TAPS"
   printf '%s\n' "宿主机网络持久化: $HOST_NET_MODE"
+  if [ "${HOST_LAN_BACKCONNECT:-0}" = "1" ]; then
+    printf '%s\n' "宿主机 LAN 回接: 开启，RouterOS=$HOST_LAN_ROS_IFACE, 宿主机桥=$HOST_LAN_BRIDGE, DHCP route metric=$HOST_LAN_DHCP_ROUTE_METRIC"
+  else
+    printf '%s\n' "宿主机 LAN 回接: 关闭"
+  fi
   warn "如果选中的网口原来属于宿主机网络，启动 RouterOS 时会被接管，宿主机不再直接在这些网口上拿 IP。"
   pause
 }
@@ -1688,6 +1964,9 @@ build_preset_rsc(){
   mkdir -p "$CONFIG_DIR"
   if [ -z "${ROS_IFACE_NAMES:-}" ]; then
     ROS_IFACE_NAMES="$(derive_ros_iface_names)"
+  fi
+  if [ "${HOST_LAN_BACKCONNECT:-0}" = "1" ] && word_in_string "${HOST_LAN_ROS_IFACE:-}" "$ROS_IFACE_NAMES"; then
+    ROS_LAN_PORTS="$(append_word_unique "$ROS_LAN_PORTS" "$HOST_LAN_ROS_IFACE")"
   fi
   validate_routeros_config || return 1
   local network lan_cidr identity_q wan_q bridge_q dns_clean rename_cmds lan_port_cmds index iface iface_q default_name default_q port port_q
@@ -1784,6 +2063,11 @@ show_routeros_preset_values(){
   printf '  %-18s %s\n' "WAN" "$ROS_WAN_IFACE DHCP"
   printf '  %-18s %s\n' "LAN bridge" "$ROS_LAN_BRIDGE"
   printf '  %-18s %s\n' "LAN ports" "${ROS_LAN_PORTS:-无}"
+  if [ "${HOST_LAN_BACKCONNECT:-0}" = "1" ]; then
+    printf '  %-18s %s -> %s DHCP metric %s\n' "host backconnect" "$HOST_LAN_ROS_IFACE" "$HOST_LAN_BRIDGE" "$HOST_LAN_DHCP_ROUTE_METRIC"
+  else
+    printf '  %-18s %s\n' "host backconnect" "disabled"
+  fi
   printf '  %-18s %s/%s\n' "LAN IP" "$ROS_LAN_IP" "$ROS_LAN_PREFIX"
   printf '  %-18s %s-%s\n' "DHCP pool" "$ROS_DHCP_START" "$ROS_DHCP_END"
   printf '  %-18s %s\n' "DNS" "$ROS_DNS_SERVERS"
