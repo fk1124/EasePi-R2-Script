@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-VERSION="2026-05-20-routeros-chr-installer-r19"
+VERSION="2026-05-20-routeros-chr-installer-r20"
 
 INSTALL_CMD="/usr/local/sbin/routerosinstall"
 CONSOLE_CMD="/usr/local/sbin/routeros"
@@ -1313,6 +1313,8 @@ queues="${NET_QUEUES:-1}"
 host_lan_enabled="${HOST_LAN_BACKCONNECT:-0}"
 host_lan_bridge="${HOST_LAN_BRIDGE:-}"
 host_lan_metric="${HOST_LAN_DHCP_ROUTE_METRIC:-100}"
+host_lan_dns="${ROS_LAN_IP:-}"
+RESOLVED_DROPIN="/run/systemd/resolved.conf.d/99-routerosinstall-host-lan.conf"
 
 is_uint(){
   [[ "${1:-}" =~ ^[0-9]+$ ]]
@@ -1469,6 +1471,39 @@ runtime_networkd_file(){
   printf '/run/systemd/network/00-routerosinstall-%s.network' "$br"
 }
 
+configure_host_lan_resolved(){
+  local br="$1" dns="${host_lan_dns:-}"
+  [ "$host_lan_enabled" = "1" ] || return 0
+  [ -n "$br" ] || return 0
+  [ -n "$dns" ] || return 0
+
+  if command -v resolvectl >/dev/null 2>&1; then
+    resolvectl dns "$br" "$dns" >/dev/null 2>&1 || true
+    resolvectl domain "$br" '~.' >/dev/null 2>&1 || true
+    resolvectl default-route "$br" true >/dev/null 2>&1 || true
+  fi
+  if systemctl is-active --quiet systemd-resolved.service 2>/dev/null; then
+    mkdir -p "$(dirname "$RESOLVED_DROPIN")"
+    cat > "$RESOLVED_DROPIN" <<EOF_RESOLVED
+[Resolve]
+DNS=$dns
+Domains=~.
+EOF_RESOLVED
+    systemctl restart systemd-resolved.service 2>/dev/null || true
+  fi
+}
+
+remove_host_lan_resolved(){
+  local br="$1"
+  if command -v resolvectl >/dev/null 2>&1 && [ -n "$br" ]; then
+    resolvectl revert "$br" >/dev/null 2>&1 || true
+  fi
+  if [ -f "$RESOLVED_DROPIN" ]; then
+    rm -f "$RESOLVED_DROPIN" 2>/dev/null || true
+    systemctl restart systemd-resolved.service 2>/dev/null || true
+  fi
+}
+
 start_networkd_dhcp(){
   local br="$1" file
   command -v networkctl >/dev/null 2>&1 || return 1
@@ -1486,6 +1521,8 @@ RequiredForOnline=no
 DHCP=ipv4
 LinkLocalAddressing=no
 IPv6AcceptRA=no
+DNSDefaultRoute=yes
+Domains=~.
 
 [DHCPv4]
 RouteMetric=$host_lan_metric
@@ -1519,10 +1556,12 @@ start_host_lan_dhcp(){
   ip link set "$br" up 2>/dev/null || true
   if start_networkd_dhcp "$br"; then
     echo "routerosinstall: host LAN backconnect DHCP via systemd-networkd on $br" >&2
+    configure_host_lan_resolved "$br"
     return 0
   fi
   if start_dhcp_client "$br"; then
     echo "routerosinstall: host LAN backconnect DHCP client started on $br" >&2
+    configure_host_lan_resolved "$br"
     return 0
   fi
   echo "routerosinstall: host LAN backconnect enabled on $br, but no DHCP manager/client was available" >&2
@@ -1531,6 +1570,7 @@ start_host_lan_dhcp(){
 
 stop_host_lan_dhcp(){
   local br="$1" pid file
+  remove_host_lan_resolved "$br"
   file="$(runtime_networkd_file "$br")"
   rm -f "$file" 2>/dev/null || true
   if command -v networkctl >/dev/null 2>&1; then
@@ -1549,6 +1589,37 @@ stop_host_lan_dhcp(){
   if command -v dhcpcd >/dev/null 2>&1; then
     dhcpcd -k "$br" >/dev/null 2>&1 || true
   fi
+}
+
+host_lan_has_ipv4(){
+  local br="$1"
+  ip -4 addr show dev "$br" 2>/dev/null | grep -q 'inet '
+}
+
+renew_host_lan_dhcp(){
+  local br="${1:-$host_lan_bridge}" wait_s="${2:-20}" i
+  [ "$host_lan_enabled" = "1" ] || return 0
+  [ -n "$br" ] || return 0
+  ip link show "$br" >/dev/null 2>&1 || return 0
+  ip link set "$br" up 2>/dev/null || true
+  if command -v networkctl >/dev/null 2>&1 && systemctl is-active --quiet systemd-networkd.service 2>/dev/null; then
+    networkctl reload 2>/dev/null || true
+    networkctl reconfigure "$br" 2>/dev/null || true
+    networkctl renew "$br" 2>/dev/null || true
+  elif ! host_lan_has_ipv4 "$br"; then
+    start_dhcp_client "$br" >/dev/null 2>&1 || true
+  fi
+  for ((i=0; i<wait_s; i++)); do
+    if host_lan_has_ipv4 "$br"; then
+      configure_host_lan_resolved "$br"
+      echo "routerosinstall: host LAN backconnect is ready on $br" >&2
+      return 0
+    fi
+    sleep 1
+  done
+  configure_host_lan_resolved "$br"
+  echo "routerosinstall: host LAN backconnect DHCP still pending on $br" >&2
+  return 1
 }
 
 reload_persistent_network_managers(){
@@ -1586,6 +1657,9 @@ case "$ACTION" in
   apply-persistent)
     reload_persistent_network_managers
     ;;
+  renew-host-lan-dhcp)
+    renew_host_lan_dhcp "$host_lan_bridge" "${2:-20}" || true
+    ;;
   up)
     preflight_up
     : > "$STATE_FILE"
@@ -1610,6 +1684,7 @@ case "$ACTION" in
       fi
       if [ -n "$iface" ] && [ "$iface" != "none" ]; then
         if ip link show "$iface" >/dev/null 2>&1; then
+          ip route flush dev "$iface" 2>/dev/null || true
           ip addr flush dev "$iface" 2>/dev/null || true
           ip link set "$iface" nomaster 2>/dev/null || true
           ip link set "$iface" up 2>/dev/null || true
@@ -1658,7 +1733,7 @@ case "$ACTION" in
     rm -f "$STATE_FILE" 2>/dev/null || true
     ;;
   *)
-    echo "usage: $0 up|down|apply-persistent" >&2
+    echo "usage: $0 up|down|apply-persistent|renew-host-lan-dhcp [seconds]" >&2
     exit 2
     ;;
 esac
@@ -2235,6 +2310,10 @@ apply_autostart_choice(){
   rm -f "$AUTOSTART_ENABLE_FILE" "$AUTOSTART_DISABLE_FILE" 2>/dev/null || true
 }
 
+settle_host_lan(){
+  [ -x "$HOSTNET_SCRIPT" ] && "$HOSTNET_SCRIPT" renew-host-lan-dhcp 20 2>/dev/null || true
+}
+
 if ! systemctl is-active --quiet routeros-chr.service 2>/dev/null; then
   echo "routerosinstall: starting routeros-chr.service"
   if ! systemctl start routeros-chr.service; then
@@ -2247,12 +2326,13 @@ fi
 case "${AUTO_APPLY_PRESET:-1}:${QGA_ENABLED:-1}" in
   1:1|y:1|yes:1|true:1)
     qga_wait="$rollback_seconds"
-    if [ -x "$SERIAL_APPLY_SCRIPT" ] && [ "$qga_wait" -gt 30 ] 2>/dev/null; then
-      qga_wait=30
+    if [ -x "$SERIAL_APPLY_SCRIPT" ] && [ "$qga_wait" -gt 15 ] 2>/dev/null; then
+      qga_wait=15
     fi
     echo "routerosinstall: applying preset through QEMU guest agent"
     if "$QGA_APPLY_SCRIPT" "$qga_wait"; then
       touch "$OK_FILE" 2>/dev/null || true
+      settle_host_lan
       apply_autostart_choice
       echo "routerosinstall: preset applied successfully"
       exit 0
@@ -2262,6 +2342,7 @@ case "${AUTO_APPLY_PRESET:-1}:${QGA_ENABLED:-1}" in
     [ "$serial_wait" -ge 30 ] 2>/dev/null || serial_wait=30
     if [ -x "$SERIAL_APPLY_SCRIPT" ] && "$SERIAL_APPLY_SCRIPT" "$serial_wait"; then
       touch "$OK_FILE" 2>/dev/null || true
+      settle_host_lan
       apply_autostart_choice
       echo "routerosinstall: preset applied successfully through serial fallback"
       exit 0
@@ -2274,6 +2355,7 @@ case "${AUTO_APPLY_PRESET:-1}:${QGA_ENABLED:-1}" in
     echo "routerosinstall: applying preset through serial socket"
     if [ -x "$SERIAL_APPLY_SCRIPT" ] && "$SERIAL_APPLY_SCRIPT" "$rollback_seconds"; then
       touch "$OK_FILE" 2>/dev/null || true
+      settle_host_lan
       apply_autostart_choice
       echo "routerosinstall: preset applied successfully through serial"
       exit 0
@@ -2294,8 +2376,7 @@ EOF_BOOTSTRAP_APPLY
   atomic_write "$SERVICE_FILE" 0644 <<EOF_SERVICE
 [Unit]
 Description=RouterOS CHR virtual machine
-After=network-online.target
-Wants=network-online.target
+After=systemd-networkd.service NetworkManager.service
 
 [Service]
 Type=simple
@@ -2315,8 +2396,7 @@ EOF_SERVICE
   atomic_write "$BOOTSTRAP_APPLY_SERVICE_FILE" 0644 <<EOF_BOOTSTRAP_SERVICE
 [Unit]
 Description=RouterOS CHR bootstrap start and QGA preset apply
-After=network-online.target
-Wants=network-online.target
+After=systemd-networkd.service NetworkManager.service
 
 [Service]
 Type=oneshot
@@ -2335,9 +2415,14 @@ EOF_BOOTSTRAP_SERVICE
 }
 
 remove_persistent_network_files(){
+  local resolved_dropin="/run/systemd/resolved.conf.d/99-routerosinstall-host-lan.conf"
   rm -f "$NETWORKD_PREFIX"-*.netdev "$NETWORKD_PREFIX"-*.network 2>/dev/null || true
   rm -f "$NETWORKD_LEGACY_PREFIX"-*.netdev "$NETWORKD_LEGACY_PREFIX"-*.network 2>/dev/null || true
   rm -f "$NM_UNMANAGED_CONF" 2>/dev/null || true
+  if [ -f "$resolved_dropin" ]; then
+    rm -f "$resolved_dropin" 2>/dev/null || true
+    systemctl restart systemd-resolved.service 2>/dev/null || true
+  fi
 }
 
 remove_routeros_dir(){
@@ -2384,6 +2469,8 @@ RequiredForOnline=no
 DHCP=ipv4
 LinkLocalAddressing=no
 IPv6AcceptRA=no
+DNSDefaultRoute=yes
+Domains=~.
 
 [DHCPv4]
 RouteMetric=$metric
