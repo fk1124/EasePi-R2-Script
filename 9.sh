@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-VERSION="2026-05-20-routeros-chr-installer-r18"
+VERSION="2026-05-20-routeros-chr-installer-r19"
 
 INSTALL_CMD="/usr/local/sbin/routerosinstall"
 CONSOLE_CMD="/usr/local/sbin/routeros"
@@ -1551,7 +1551,41 @@ stop_host_lan_dhcp(){
   fi
 }
 
+reload_persistent_network_managers(){
+  local mode="${HOST_NET_MODE:-networkd}" iface br
+  echo "routerosinstall: applying host network manager config mode=$mode" >&2
+  case "$mode" in
+    networkd|both|runtime)
+      if command -v networkctl >/dev/null 2>&1; then
+        networkctl reload 2>/dev/null || true
+        for br in "${bridges[@]}"; do
+          [ -n "$br" ] || continue
+          networkctl reconfigure "$br" 2>/dev/null || true
+        done
+        for iface in "${ifaces[@]}"; do
+          [ -n "$iface" ] || continue
+          [ "$iface" = "none" ] && continue
+          networkctl reconfigure "$iface" 2>/dev/null || true
+        done
+      elif command -v systemctl >/dev/null 2>&1; then
+        systemctl reload systemd-networkd 2>/dev/null || true
+      fi
+      ;;
+  esac
+
+  case "$mode" in
+    nm-unmanaged|both|runtime)
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl reload NetworkManager 2>/dev/null || systemctl restart NetworkManager 2>/dev/null || true
+      fi
+      ;;
+  esac
+}
+
 case "$ACTION" in
+  apply-persistent)
+    reload_persistent_network_managers
+    ;;
   up)
     preflight_up
     : > "$STATE_FILE"
@@ -1624,7 +1658,7 @@ case "$ACTION" in
     rm -f "$STATE_FILE" 2>/dev/null || true
     ;;
   *)
-    echo "usage: $0 up|down" >&2
+    echo "usage: $0 up|down|apply-persistent" >&2
     exit 2
     ;;
 esac
@@ -2265,6 +2299,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=$HOSTNET_SCRIPT apply-persistent
 ExecStartPre=$HOSTNET_SCRIPT up
 ExecStart=$START_SCRIPT
 ExecStopPost=$HOSTNET_SCRIPT down
@@ -2463,8 +2498,6 @@ write_persistent_network_files(){
       remove_persistent_network_files
       ;;
   esac
-
-  reload_persistent_network_managers
 }
 
 menu_vm_config(){
@@ -2523,6 +2556,7 @@ menu_vm_config(){
     printf '%s\n' "宿主机 LAN 回接: 关闭"
   fi
   warn "如果选中的网口原来属于宿主机网络，启动 RouterOS 时会被接管，宿主机不再直接在这些网口上拿 IP。"
+  info "配置保存阶段不会刷新 networkd/NetworkManager；实际接管会在启动 RouterOS 时发生。"
   pause
 }
 
@@ -2875,11 +2909,13 @@ menu_guided_install(){
   print_title
   show_install_summary
   printf '\n'
-  warn "如果当前是从会被接管的管理口 SSH 进入，执行后 SSH 可能立刻断开，属于正常现象。"
+  warn "确认启动后会先提交 systemd 后台任务，然后才刷新 networkd/NetworkManager 并接管网口。"
+  warn "如果当前是从会被接管的管理口 SSH 进入，确认后 SSH 可能立刻断开，后台任务会继续执行。"
   warn "请把下级设备接到 RouterOS LAN 口，等待获取 ${ROS_LAN_IP%.*}.x 地址后访问 http://$ROS_LAN_IP/ 管理。"
   warn "若 ${BOOTSTRAP_ROLLBACK_SECONDS}s 内无法获取 IP，可能是启动或 QGA guest-exec 导入失败，脚本会等待回滚后释放宿主机网口。"
+  info "确认前可先记下日志命令: journalctl -u routeros-chr-bootstrap-apply.service -f"
   if ! confirm "是否立即执行并启动 RouterOS" "n"; then
-    warn "已保存配置，但未启动。"
+    warn "已保存配置，但未启动；本次不会刷新 networkd/NetworkManager。"
     pause
     return 0
   fi
@@ -2901,6 +2937,7 @@ show_install_summary(){
   printf '  %-18s %s (%s)\n' "镜像" "$IMAGE_PATH" "$DISK_FORMAT"
   printf '  %-18s %s vCPU / %s MB / queues=%s\n' "虚拟机" "$VM_CPUS" "$VM_MEMORY_MB" "$NET_QUEUES"
   printf '  %-18s %s\n' "宿主机网口" "$VM_IFACES"
+  printf '  %-18s %s\n' "宿主机持久化" "$HOST_NET_MODE"
   printf '  %-18s %s\n' "RouterOS 网口" "$ROS_IFACE_NAMES"
   printf '  %-18s WAN=%s, LAN=%s\n' "预设网络" "$ROS_WAN_IFACE" "$ROS_LAN_PORTS"
   printf '  %-18s %s/%s, DHCP %s-%s\n' "LAN" "$ROS_LAN_IP" "$ROS_LAN_PREFIX" "$ROS_DHCP_START" "$ROS_DHCP_END"
