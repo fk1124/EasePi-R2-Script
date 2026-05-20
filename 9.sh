@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-VERSION="2026-05-20-routeros-chr-installer-r16"
+VERSION="2026-05-20-routeros-chr-installer-r17"
 
 INSTALL_CMD="/usr/local/sbin/routerosinstall"
 CONSOLE_CMD="/usr/local/sbin/routeros"
@@ -2475,27 +2475,47 @@ build_preset_rsc(){
     ROS_LAN_PORTS="$(append_word_unique "$ROS_LAN_PORTS" "$HOST_LAN_ROS_IFACE")"
   fi
   validate_routeros_config || return 1
-  local network lan_cidr identity_q wan_q bridge_q dns_clean rename_cmds lan_port_cmds index iface iface_q default_name default_q port port_q
+  local network lan_cidr identity_q wan_q bridge_q dns_clean rename_cmds final_rename_cmds lan_port_cmds index zero iface iface_q default_name default_q mac mac_q temp_name temp_q stale_q port port_q
+  local -a preset_macs
   network="$(cidr_network "$ROS_LAN_IP" "$ROS_LAN_PREFIX")"
   lan_cidr="$network/$ROS_LAN_PREFIX"
   identity_q="$(ros_quote "$ROS_IDENTITY")"
   wan_q="$(ros_quote "$ROS_WAN_IFACE")"
   bridge_q="$(ros_quote "$ROS_LAN_BRIDGE")"
   dns_clean="$(strip_spaces "$ROS_DNS_SERVERS")"
+  read -r -a preset_macs <<< "${VM_MACS:-}"
   rename_cmds=""
+  final_rename_cmds=""
   index=1
   for iface in $ROS_IFACE_NAMES; do
+    zero=$((index - 1))
     iface_q="$(ros_quote "$iface")"
     default_name="ether$index"
     default_q="$(ros_quote "$default_name")"
-    if [ "$iface" != "$default_name" ]; then
-      rename_cmds+=$(printf ':do { /interface ethernet set [find default-name=%s] name=%s comment="routerosinstall: mapped from %s" } on-error={}' "$default_q" "$iface_q" "$default_name")
+    mac="${preset_macs[$zero]:-}"
+    if [ -n "$mac" ]; then
+      mac="${mac^^}"
+      mac_q="$(ros_quote "$mac")"
+      temp_name="ri-${mac//:/}"
+      temp_q="$(ros_quote "$temp_name")"
+      rename_cmds+=$(printf ':do { /interface ethernet set [find mac-address=%s] name=%s comment="routerosinstall: mapping %s" } on-error={}' "$mac_q" "$temp_q" "$mac")
+      rename_cmds+=$'\n'
+      stale_q="$(ros_quote "riold$index")"
+      final_rename_cmds+=$(printf ':do { /interface ethernet set [find name=%s] name=%s comment="routerosinstall: displaced stale name" } on-error={}' "$iface_q" "$stale_q")
+      final_rename_cmds+=$'\n'
+      final_rename_cmds+=$(printf ':do { /interface ethernet set [find mac-address=%s] name=%s comment="routerosinstall: mapped from MAC %s" } on-error={}' "$mac_q" "$iface_q" "$mac")
+      final_rename_cmds+=$'\n'
+    else
+      if [ "$iface" != "$default_name" ]; then
+        rename_cmds+=$(printf ':do { /interface ethernet set [find default-name=%s] name=%s comment="routerosinstall: mapped from %s" } on-error={}' "$default_q" "$iface_q" "$default_name")
+        rename_cmds+=$'\n'
+      fi
+      rename_cmds+=$(printf ':do { /interface ethernet set [find name=%s] comment="routerosinstall: mapped interface" } on-error={}' "$iface_q")
       rename_cmds+=$'\n'
     fi
-    rename_cmds+=$(printf ':do { /interface ethernet set [find name=%s] comment="routerosinstall: mapped interface" } on-error={}' "$iface_q")
-    rename_cmds+=$'\n'
     index=$((index + 1))
   done
+  rename_cmds+="$final_rename_cmds"
   lan_port_cmds=""
   for port in $ROS_LAN_PORTS; do
     port_q="$(ros_quote "$port")"
