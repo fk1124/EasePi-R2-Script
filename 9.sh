@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-VERSION="2026-05-20-routeros-chr-installer-r17"
+VERSION="2026-05-20-routeros-chr-installer-r18"
 
 INSTALL_CMD="/usr/local/sbin/routerosinstall"
 CONSOLE_CMD="/usr/local/sbin/routeros"
@@ -793,6 +793,7 @@ qemu-system-aarch64|qemu-system-arm
 qemu-img|qemu-utils
 base64|coreutils
 timeout|coreutils
+python3|python3
 ip|iproute2
 socat|socat
 ssh|openssh-client
@@ -811,6 +812,7 @@ install_dependencies(){
     qemu-system-arm
     qemu-utils
     coreutils
+    python3
     iproute2
     socat
     openssh-client
@@ -2014,37 +2016,126 @@ if ! command -v socat >/dev/null 2>&1; then
   echo "routerosinstall: socat not found" >&2
   exit 1
 fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "routerosinstall: python3 not found" >&2
+  exit 1
+fi
 if ! wait_serial_sock; then
   echo "routerosinstall: serial socket not ready: $SERIAL_SOCK" >&2
   exit 1
 fi
 
-{
-  printf '\r'
-  sleep 1
-  printf 'admin\r'
-  sleep 1
-  printf '\r'
-  sleep 0.4
-  # RouterOS console probes terminal identity and cursor position after login.
-  # Answer those ANSI queries so the prompt becomes ready before sending commands.
-  printf '\033[?6c'
-  sleep 0.2
-  printf '\033[24;80R'
-  sleep 0.4
-  printf '\033[?6c'
-  sleep 0.2
-  printf '\033[24;80R'
-  sleep 2
-  while IFS= read -r line; do
-    printf '%s\r' "$line"
-    sleep 0.08
-  done < "$PRESET_RSC"
-  sleep 1
-  printf '\r'
-  printf '/quit\r'
-  sleep 1
-} | timeout 60s socat -T 5 - "UNIX-CONNECT:$SERIAL_SOCK" >"$SERIAL_APPLY_LOG" 2>&1 || true
+if ! python3 - "$SERIAL_SOCK" "$PRESET_RSC" "$SERIAL_APPLY_LOG" <<'PY_SERIAL_APPLY'
+import os
+import re
+import select
+import socket
+import sys
+import time
+
+sock_path, preset_path, log_path = sys.argv[1:4]
+ansi_re = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]")
+prompt_re = re.compile(rb"\[[^\]\r\n]+@[^\]\r\n]+\]\s*>")
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect(sock_path)
+sock.setblocking(False)
+
+os.makedirs(os.path.dirname(log_path), exist_ok=True)
+open(log_path, "wb").close()
+buffer = b""
+
+
+def write(data):
+    sock.sendall(data)
+
+
+def clean(data):
+    return ansi_re.sub(b"", data).replace(b"\r", b"")
+
+
+def answer_terminal(data):
+    if b"\x1bZ" in data:
+        write(b"\x1b[?6c")
+    for _ in range(data.count(b"\x1b[6n")):
+        write(b"\x1b[24;80R")
+
+
+def read_some(timeout=0.2):
+    global buffer
+    out = b""
+    end = time.time() + timeout
+    while time.time() < end:
+        wait = max(0.02, end - time.time())
+        ready, _, _ = select.select([sock], [], [], wait)
+        if not ready:
+            continue
+        data = sock.recv(8192)
+        if not data:
+            break
+        with open(log_path, "ab") as log:
+            log.write(data)
+        answer_terminal(data)
+        buffer = (buffer + data)[-24000:]
+        out += data
+    return out
+
+
+def prompt_seen(data=None):
+    view = clean(data if data is not None else buffer)
+    return bool(prompt_re.search(view)) or b"] >" in view[-400:] or b"]>" in view[-400:]
+
+
+def wait_prompt(timeout=45):
+    login_sent = False
+    password_sent = False
+    deadline = time.time() + timeout
+    last_nudge = 0
+    write(b"\r")
+    while time.time() < deadline:
+        data = read_some(0.25)
+        view = clean(buffer)
+        if prompt_seen(view):
+            return True
+        if (b"Login:" in view or b"MikroTik Login:" in view) and not login_sent:
+            write(b"admin\r")
+            login_sent = True
+        if b"Password:" in view and not password_sent:
+            write(b"\r")
+            password_sent = True
+        if not data and time.time() - last_nudge > 2:
+            write(b"\x1b[?6c\x1b[24;80R\r")
+            last_nudge = time.time()
+    return False
+
+
+if not wait_prompt():
+    print("routerosinstall: RouterOS serial prompt not ready", file=sys.stderr)
+    sys.exit(2)
+
+commands = []
+with open(preset_path, "r", encoding="utf-8") as preset:
+    for raw in preset:
+        line = raw.rstrip("\n")
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        commands.append(line)
+
+for line in commands:
+    write(line.encode("utf-8") + b"\r")
+    read_some(0.22)
+
+time.sleep(1)
+for line in ("/ip address print", "/ip dhcp-server print", "/interface print"):
+    write(line.encode("utf-8") + b"\r")
+    read_some(1.5)
+
+sys.exit(0)
+PY_SERIAL_APPLY
+then
+  echo "routerosinstall: serial preset sender failed" >&2
+  exit 1
+fi
 
 if wait_lan_ready; then
   echo "routerosinstall: serial preset apply appears successful"
@@ -2665,21 +2756,8 @@ apply_preset_serial(){
     warn "已取消串口自动应用。"
     return 1
   fi
-  {
-    sleep 1
-    printf '\r'
-    sleep 1
-    printf 'admin\r'
-    sleep 1
-    printf '\r'
-    sleep 2
-    while IFS= read -r line; do
-      printf '%s\r' "$line"
-      sleep 0.05
-    done < "$PRESET_RSC"
-    sleep 1
-    printf '\r/quit\r'
-  } | socat -T 60 - "UNIX-CONNECT:$SERIAL_SOCK"
+  write_runtime_files
+  "$SERIAL_APPLY_SCRIPT" "${BOOTSTRAP_ROLLBACK_SECONDS:-120}"
 }
 
 apply_preset_qga(){
