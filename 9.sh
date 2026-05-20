@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-VERSION="2026-05-20-routeros-chr-installer-r15"
+VERSION="2026-05-20-routeros-chr-installer-r16"
 
 INSTALL_CMD="/usr/local/sbin/routerosinstall"
 CONSOLE_CMD="/usr/local/sbin/routeros"
@@ -1965,6 +1965,7 @@ WAIT_SECONDS="${1:-120}"
 ROS_LAN_IP="${ROS_LAN_IP:-10.10.10.1}"
 HOST_LAN_BACKCONNECT="${HOST_LAN_BACKCONNECT:-0}"
 HOST_LAN_BRIDGE="${HOST_LAN_BRIDGE:-br-ros-host}"
+SERIAL_APPLY_LOG="/var/log/routerosinstall-serial-apply.log"
 
 is_uint(){
   [[ "${1:-}" =~ ^[0-9]+$ ]]
@@ -2024,16 +2025,26 @@ fi
   printf 'admin\r'
   sleep 1
   printf '\r'
+  sleep 0.4
+  # RouterOS console probes terminal identity and cursor position after login.
+  # Answer those ANSI queries so the prompt becomes ready before sending commands.
+  printf '\033[?6c'
+  sleep 0.2
+  printf '\033[24;80R'
+  sleep 0.4
+  printf '\033[?6c'
+  sleep 0.2
+  printf '\033[24;80R'
   sleep 2
   while IFS= read -r line; do
     printf '%s\r' "$line"
-    sleep 0.03
+    sleep 0.08
   done < "$PRESET_RSC"
   sleep 1
   printf '\r'
   printf '/quit\r'
   sleep 1
-} | timeout 30s socat -u - "UNIX-CONNECT:$SERIAL_SOCK" >/dev/null
+} | timeout 60s socat -T 5 - "UNIX-CONNECT:$SERIAL_SOCK" >"$SERIAL_APPLY_LOG" 2>&1 || true
 
 if wait_lan_ready; then
   echo "routerosinstall: serial preset apply appears successful"
