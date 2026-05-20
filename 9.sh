@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-VERSION="2026-05-20-routeros-chr-installer-r13"
+VERSION="2026-05-20-routeros-chr-installer-r15"
 
 INSTALL_CMD="/usr/local/sbin/routerosinstall"
 CONSOLE_CMD="/usr/local/sbin/routeros"
@@ -12,6 +12,7 @@ LIB_DIR="/usr/local/lib/routerosinstall"
 HOSTNET_SCRIPT="$LIB_DIR/hostnet.sh"
 START_SCRIPT="$LIB_DIR/start-vm.sh"
 QGA_APPLY_SCRIPT="$LIB_DIR/apply-preset-qga.sh"
+SERIAL_APPLY_SCRIPT="$LIB_DIR/apply-preset-serial.sh"
 APPLY_BOOTSTRAP_SCRIPT="$LIB_DIR/bootstrap-start-apply.sh"
 SERVICE_FILE="/etc/systemd/system/routeros-chr.service"
 BOOTSTRAP_APPLY_SERVICE_FILE="/etc/systemd/system/routeros-chr-bootstrap-apply.service"
@@ -59,15 +60,17 @@ read_default(){
 confirm(){
   local prompt="$1" def="${2:-y}" val hint
   if [ "$def" = "y" ]; then
-    hint="Y/n"
+    hint="Y/n，回车/空格=Y"
   else
-    hint="y/N"
+    hint="y/N，回车/空格=N"
   fi
   printf '%s' "$prompt [$hint]: " >&2
   IFS= read -r val || true
-  val="${val:-$def}"
+  if [[ "$val" =~ ^[[:space:]]*$ ]]; then
+    val="$def"
+  fi
   case "${val,,}" in
-    y|yes|1|true|ok|是|好|确认) return 0 ;;
+    y|yes|1|true|ok|是|好|确认|确认执行) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -323,15 +326,58 @@ iface_is_management(){
   return 1
 }
 
-iface_has_host_network(){
+iface_master(){
   local iface="$1"
+  [ -L "/sys/class/net/$iface/master" ] || return 0
+  basename "$(readlink -f "/sys/class/net/$iface/master" 2>/dev/null)" 2>/dev/null || true
+}
+
+iface_config_refs(){
+  local iface="$1"
+  {
+    grep -RFsl -- "Name=$iface" /etc/systemd/network /etc/netplan /etc/network/interfaces /etc/NetworkManager/system-connections 2>/dev/null || true
+    grep -RFsl -- "interface-name=$iface" /etc/systemd/network /etc/netplan /etc/network/interfaces /etc/NetworkManager/system-connections 2>/dev/null || true
+    grep -RFsl -- "$iface" /etc/netplan /etc/network/interfaces /etc/NetworkManager/system-connections 2>/dev/null || true
+  } | grep -Ev '/(00|80)-routerosinstall-|99-routerosinstall-unmanaged\.conf$' | awk 'NF && !seen[$0]++' | head -n5 | xargs 2>/dev/null || true
+}
+
+iface_networkctl_setup(){
+  local iface="$1"
+  networkctl list --no-legend --no-pager 2>/dev/null | awk -v iface="$iface" '$2 == iface {print $5; exit}'
+}
+
+iface_usage_summary(){
+  local iface="$1" reasons="" master refs setup
+  ip -o addr show dev "$iface" 2>/dev/null | grep -q . && reasons="${reasons:+$reasons, }addr"
+  ip route show dev "$iface" 2>/dev/null | grep -q . && reasons="${reasons:+$reasons, }route"
+  master="$(iface_master "$iface")"
+  [ -n "$master" ] && reasons="${reasons:+$reasons, }master=$master"
+  refs="$(iface_config_refs "$iface")"
+  [ -n "$refs" ] && reasons="${reasons:+$reasons, }config"
+  setup="$(iface_networkctl_setup "$iface")"
+  case "$setup" in
+    configured|configuring|pending|failed) reasons="${reasons:+$reasons, }networkd=$setup" ;;
+  esac
+  printf '%s' "$reasons"
+}
+
+iface_has_host_network(){
+  local iface="$1" master refs setup
   ip -o addr show dev "$iface" 2>/dev/null | grep -q . && return 0
   ip route show dev "$iface" 2>/dev/null | grep -q . && return 0
+  master="$(iface_master "$iface")"
+  [ -n "$master" ] && return 0
+  refs="$(iface_config_refs "$iface")"
+  [ -n "$refs" ] && return 0
+  setup="$(iface_networkctl_setup "$iface")"
+  case "$setup" in
+    configured|configuring|pending|failed) return 0 ;;
+  esac
   return 1
 }
 
 write_host_rollback_script(){
-  local script="${1:-$ROLLBACK_SCRIPT}" iface addr route
+  local script="${1:-$ROLLBACK_SCRIPT}" iface addr route master
   mkdir -p "$CONFIG_DIR"
   {
     printf '%s\n' '#!/usr/bin/env bash'
@@ -341,8 +387,10 @@ write_host_rollback_script(){
       [ -n "$iface" ] || continue
       [ "$iface" = "none" ] && continue
       ip link show "$iface" >/dev/null 2>&1 || continue
+      master="$(iface_master "$iface")"
       printf 'ip link set %q nomaster 2>/dev/null || true\n' "$iface"
       printf 'ip link set %q up 2>/dev/null || true\n' "$iface"
+      [ -n "$master" ] && printf 'ip link set %q master %q 2>/dev/null || true\n' "$iface" "$master"
       while IFS= read -r addr; do
         [ -n "$addr" ] || continue
         printf 'ip addr add %q dev %q 2>/dev/null || true\n' "$addr" "$iface"
@@ -379,7 +427,7 @@ confirm_host_iface_takeover(){
   fi
 
   printf '\n'
-  warn "以下网口当前带有宿主机地址/路由，或看起来是管理入口: ${dangerous[*]}"
+  warn "以下网口当前已有宿主机地址/路由、桥接 master、网络配置引用，或看起来是管理入口: ${dangerous[*]}"
   warn "RouterOS 启动时会清空这些网口 IP 并加入 br-rosX，SSH 可能断开。"
   write_host_rollback_script "$ROLLBACK_SCRIPT" || true
   info "已生成尽力回滚脚本: $ROLLBACK_SCRIPT"
@@ -850,12 +898,20 @@ detect_network_managers(){
 }
 
 show_iface_usage(){
-  local iface="$1" master addrs routes config
-  master="$(basename "$(readlink -f "/sys/class/net/$iface/master" 2>/dev/null)" 2>/dev/null || true)"
+  local iface="$1" master addrs routes config setup usage
+  master="$(iface_master "$iface")"
   addrs="$(ip -o -4 addr show dev "$iface" 2>/dev/null | awk '{print $4}' | xargs 2>/dev/null || true)"
   routes="$(ip route show dev "$iface" 2>/dev/null | sed 's/^/    /')"
-  config="$(grep -Rsl "Name=$iface\\|interface-name=$iface\\|$iface" /etc/systemd/network /etc/netplan /etc/network/interfaces /etc/NetworkManager/system-connections 2>/dev/null | head -n5 | xargs 2>/dev/null || true)"
+  config="$(iface_config_refs "$iface")"
+  setup="$(iface_networkctl_setup "$iface")"
+  usage="$(iface_usage_summary "$iface")"
   printf '  %-10s state=%-8s master=%-10s addr=%s\n' "$iface" "$(cat "/sys/class/net/$iface/operstate" 2>/dev/null)" "${master:-无}" "${addrs:-无}"
+  if [ -n "$usage" ]; then
+    printf '    占用/管理: %s\n' "$usage"
+  fi
+  if [ -n "$setup" ]; then
+    printf '    networkd: %s\n' "$setup"
+  fi
   if [ -n "$routes" ]; then
     printf '%s\n' "$routes"
   fi
@@ -893,7 +949,7 @@ menu_network_check(){
 }
 
 network_warning_summary(){
-  local managers="" default_ifaces="" active_ifaces="" iface
+  local managers="" default_ifaces="" active_ifaces="" iface usage
   systemctl is-active --quiet systemd-networkd 2>/dev/null && managers="${managers:+$managers, }systemd-networkd"
   systemctl is-active --quiet NetworkManager 2>/dev/null && managers="${managers:+$managers, }NetworkManager"
   systemctl is-active --quiet networking 2>/dev/null && managers="${managers:+$managers, }ifupdown"
@@ -901,15 +957,16 @@ network_warning_summary(){
   default_ifaces="$(ip route show default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") print $(i+1)}' | awk 'NF && !seen[$0]++' | xargs 2>/dev/null || true)"
   while IFS= read -r iface; do
     [ -n "$iface" ] || continue
-    if ip -o -4 addr show dev "$iface" 2>/dev/null | grep -q . || ip route show dev "$iface" 2>/dev/null | grep -q .; then
-      active_ifaces="${active_ifaces:+$active_ifaces }$iface"
+    usage="$(iface_usage_summary "$iface")"
+    if [ -n "$usage" ]; then
+      active_ifaces="${active_ifaces:+$active_ifaces }$iface($usage)"
     fi
   done < <(physical_ifaces)
 
   printf '%s\n' "网络提醒:"
   printf '  %-14s %s\n' "管理器" "${managers:-未发现常见管理器运行}"
   printf '  %-14s %s\n' "默认路由网口" "${default_ifaces:-无}"
-  printf '  %-14s %s\n' "当前有配置网口" "${active_ifaces:-无}"
+  printf '  %-14s %s\n' "被管理/占用网口" "${active_ifaces:-无}"
   warn "后续分配给 RouterOS 的物理网口会被接管；如果当前 SSH 走这些口，启动时断开是正常现象。"
 }
 
@@ -1272,9 +1329,22 @@ is_allowed_danger_iface(){
 }
 
 iface_has_host_network(){
-  local iface="$1"
+  local iface="$1" master refs setup
   ip -o addr show dev "$iface" 2>/dev/null | grep -q . && return 0
   ip route show dev "$iface" 2>/dev/null | grep -q . && return 0
+  master=""
+  [ -L "/sys/class/net/$iface/master" ] && master="$(basename "$(readlink -f "/sys/class/net/$iface/master" 2>/dev/null)" 2>/dev/null || true)"
+  [ -n "$master" ] && return 0
+  refs="$({
+    grep -RFsl -- "Name=$iface" /etc/systemd/network /etc/netplan /etc/network/interfaces /etc/NetworkManager/system-connections 2>/dev/null || true
+    grep -RFsl -- "interface-name=$iface" /etc/systemd/network /etc/netplan /etc/network/interfaces /etc/NetworkManager/system-connections 2>/dev/null || true
+    grep -RFsl -- "$iface" /etc/netplan /etc/network/interfaces /etc/NetworkManager/system-connections 2>/dev/null || true
+  } | grep -Ev '/(00|80)-routerosinstall-|99-routerosinstall-unmanaged\.conf$' | awk 'NF && !seen[$0]++' | head -n5 | xargs 2>/dev/null || true)"
+  [ -n "$refs" ] && return 0
+  setup="$(networkctl list --no-legend --no-pager 2>/dev/null | awk -v iface="$iface" '$2 == iface {print $5; exit}')"
+  case "$setup" in
+    configured|configuring|pending|failed) return 0 ;;
+  esac
   return 1
 }
 
@@ -1297,7 +1367,7 @@ iface_is_management(){
 }
 
 write_rollback_script(){
-  local iface addr route tmp
+  local iface addr route tmp master
   mkdir -p "$(dirname "$ROLLBACK_SCRIPT")"
   tmp="$(mktemp "$(dirname "$ROLLBACK_SCRIPT")/.rollback.XXXXXX")" || return 1
   {
@@ -1308,8 +1378,11 @@ write_rollback_script(){
       [ -n "$iface" ] || continue
       [ "$iface" = "none" ] && continue
       ip link show "$iface" >/dev/null 2>&1 || continue
+      master=""
+      [ -L "/sys/class/net/$iface/master" ] && master="$(basename "$(readlink -f "/sys/class/net/$iface/master" 2>/dev/null)" 2>/dev/null || true)"
       printf 'ip link set %q nomaster 2>/dev/null || true\n' "$iface"
       printf 'ip link set %q up 2>/dev/null || true\n' "$iface"
+      [ -n "$master" ] && printf 'ip link set %q master %q 2>/dev/null || true\n' "$iface" "$master"
       while IFS= read -r addr; do
         [ -n "$addr" ] || continue
         printf 'ip addr add %q dev %q 2>/dev/null || true\n' "$addr" "$iface"
@@ -1879,6 +1952,98 @@ while true; do
 done
 EOF_QGA_APPLY
 
+  atomic_write "$SERIAL_APPLY_SCRIPT" 0755 <<'EOF_SERIAL_APPLY'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="/etc/routerosinstall/config.env"
+PRESET_RSC="/etc/routerosinstall/routeros-preset.rsc"
+[ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+SERIAL_SOCK="${SERIAL_SOCK:-/run/routeros/serial.sock}"
+WAIT_SECONDS="${1:-120}"
+ROS_LAN_IP="${ROS_LAN_IP:-10.10.10.1}"
+HOST_LAN_BACKCONNECT="${HOST_LAN_BACKCONNECT:-0}"
+HOST_LAN_BRIDGE="${HOST_LAN_BRIDGE:-br-ros-host}"
+
+is_uint(){
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+if ! is_uint "$WAIT_SECONDS" || [ "$WAIT_SECONDS" -lt 5 ]; then
+  WAIT_SECONDS=120
+fi
+
+wait_serial_sock(){
+  local deadline
+  deadline=$(( $(date +%s) + WAIT_SECONDS ))
+  while true; do
+    [ -S "$SERIAL_SOCK" ] && return 0
+    [ "$(date +%s)" -ge "$deadline" ] && return 1
+    sleep 1
+  done
+}
+
+wait_lan_ready(){
+  local deadline gw_mac
+  deadline=$(( $(date +%s) + WAIT_SECONDS ))
+  while true; do
+    if [ "${HOST_LAN_BACKCONNECT:-0}" = "1" ] && ip link show "$HOST_LAN_BRIDGE" >/dev/null 2>&1; then
+      if ip -4 addr show dev "$HOST_LAN_BRIDGE" 2>/dev/null | grep -q .; then
+        return 0
+      fi
+    fi
+    if ping -c 1 -W 1 "$ROS_LAN_IP" >/dev/null 2>&1; then
+      return 0
+    fi
+    if command -v ip >/dev/null 2>&1; then
+      gw_mac="$(ip neigh show "$ROS_LAN_IP" 2>/dev/null | awk -v ip="$ROS_LAN_IP" '$1 == ip {print $5; exit}')"
+      [ -n "$gw_mac" ] && return 0
+    fi
+    [ "$(date +%s)" -ge "$deadline" ] && return 1
+    sleep 2
+  done
+}
+
+if [ ! -r "$PRESET_RSC" ]; then
+  echo "routerosinstall: preset file not found: $PRESET_RSC" >&2
+  exit 1
+fi
+if ! command -v socat >/dev/null 2>&1; then
+  echo "routerosinstall: socat not found" >&2
+  exit 1
+fi
+if ! wait_serial_sock; then
+  echo "routerosinstall: serial socket not ready: $SERIAL_SOCK" >&2
+  exit 1
+fi
+
+{
+  printf '\r'
+  sleep 1
+  printf 'admin\r'
+  sleep 1
+  printf '\r'
+  sleep 2
+  while IFS= read -r line; do
+    printf '%s\r' "$line"
+    sleep 0.03
+  done < "$PRESET_RSC"
+  sleep 1
+  printf '\r'
+  printf '/quit\r'
+  sleep 1
+} | timeout 30s socat -u - "UNIX-CONNECT:$SERIAL_SOCK" >/dev/null
+
+if wait_lan_ready; then
+  echo "routerosinstall: serial preset apply appears successful"
+  exit 0
+fi
+
+echo "routerosinstall: serial preset sent, but LAN readiness check failed" >&2
+exit 1
+EOF_SERIAL_APPLY
+
   atomic_write "$APPLY_BOOTSTRAP_SCRIPT" 0755 <<'EOF_BOOTSTRAP_APPLY'
 #!/usr/bin/env bash
 set -u
@@ -1888,6 +2053,7 @@ CONFIG_FILE="/etc/routerosinstall/config.env"
 
 HOSTNET_SCRIPT="/usr/local/lib/routerosinstall/hostnet.sh"
 QGA_APPLY_SCRIPT="/usr/local/lib/routerosinstall/apply-preset-qga.sh"
+SERIAL_APPLY_SCRIPT="/usr/local/lib/routerosinstall/apply-preset-serial.sh"
 LOG_FILE="/var/log/routerosinstall-bootstrap.log"
 OK_FILE="/run/routeros/bootstrap-apply.ok"
 FAIL_FILE="/run/routeros/bootstrap-apply.fail"
@@ -1944,14 +2110,39 @@ fi
 
 case "${AUTO_APPLY_PRESET:-1}:${QGA_ENABLED:-1}" in
   1:1|y:1|yes:1|true:1)
+    qga_wait="$rollback_seconds"
+    if [ -x "$SERIAL_APPLY_SCRIPT" ] && [ "$qga_wait" -gt 30 ] 2>/dev/null; then
+      qga_wait=30
+    fi
     echo "routerosinstall: applying preset through QEMU guest agent"
-    if "$QGA_APPLY_SCRIPT" "$rollback_seconds"; then
+    if "$QGA_APPLY_SCRIPT" "$qga_wait"; then
       touch "$OK_FILE" 2>/dev/null || true
       apply_autostart_choice
       echo "routerosinstall: preset applied successfully"
       exit 0
     fi
+    echo "routerosinstall: QGA preset apply failed, trying serial socket fallback"
+    serial_wait=$((rollback_seconds - ($(date +%s) - start_ts)))
+    [ "$serial_wait" -ge 30 ] 2>/dev/null || serial_wait=30
+    if [ -x "$SERIAL_APPLY_SCRIPT" ] && "$SERIAL_APPLY_SCRIPT" "$serial_wait"; then
+      touch "$OK_FILE" 2>/dev/null || true
+      apply_autostart_choice
+      echo "routerosinstall: preset applied successfully through serial fallback"
+      exit 0
+    fi
     echo "routerosinstall: preset apply failed"
+    rollback_after_failure
+    exit 1
+    ;;
+  1:0|y:0|yes:0|true:0)
+    echo "routerosinstall: applying preset through serial socket"
+    if [ -x "$SERIAL_APPLY_SCRIPT" ] && "$SERIAL_APPLY_SCRIPT" "$rollback_seconds"; then
+      touch "$OK_FILE" 2>/dev/null || true
+      apply_autostart_choice
+      echo "routerosinstall: preset applied successfully through serial"
+      exit 0
+    fi
+    echo "routerosinstall: serial preset apply failed"
     rollback_after_failure
     exit 1
     ;;
