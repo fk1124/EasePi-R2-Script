@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-VERSION="2026-05-19-routeros-chr-installer-r10"
+VERSION="2026-05-20-routeros-chr-installer-r11"
 
 INSTALL_CMD="/usr/local/sbin/routerosinstall"
 CONSOLE_CMD="/usr/local/sbin/routeros"
@@ -177,6 +177,64 @@ validate_name_list(){
   return "$ok"
 }
 
+first_word(){
+  local first=""
+  read -r first _ <<< "${1:-}"
+  printf '%s' "$first"
+}
+
+list_without_first(){
+  local first item out=""
+  first=1
+  for item in $*; do
+    if [ "$first" -eq 1 ]; then
+      first=0
+      continue
+    fi
+    out="${out:+$out }$item"
+  done
+  printf '%s' "$out"
+}
+
+join_words(){
+  local item out=""
+  for item in "$@"; do
+    [ -n "$item" ] || continue
+    out="${out:+$out }$item"
+  done
+  printf '%s' "$out"
+}
+
+default_ros_name_for_slot(){
+  local index="$1" host_iface="${2:-}"
+  if [ -n "$host_iface" ] && [ "$host_iface" != "none" ] && is_ros_ifname "$host_iface"; then
+    printf '%s' "$host_iface"
+  else
+    printf 'ether%s' "$index"
+  fi
+}
+
+derive_ros_iface_names(){
+  local idx=1 iface name out=""
+  for iface in $VM_IFACES; do
+    name="$(default_ros_name_for_slot "$idx" "$iface")"
+    out="${out:+$out }$name"
+    idx=$((idx + 1))
+  done
+  printf '%s' "$out"
+}
+
+sync_routeros_defaults_from_vm(){
+  local names
+  names="${ROS_IFACE_NAMES:-}"
+  if [ -z "$names" ] || [ "$(wc -w <<< "$names")" -ne "$(wc -w <<< "${VM_IFACES:-}")" ]; then
+    names="$(derive_ros_iface_names)"
+  fi
+  ROS_IFACE_NAMES="$names"
+  ROS_WAN_IFACE="$(first_word "$ROS_IFACE_NAMES")"
+  ROS_LAN_PORTS="$(list_without_first $ROS_IFACE_NAMES)"
+}
+
 management_ifaces(){
   {
     ip route show default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") print $(i+1)}'
@@ -336,11 +394,15 @@ validate_vm_config(){
   for item in $VM_MACS; do
     is_mac "$item" || { err "MAC 地址非法: $item"; ok_flag=1; }
   done
+  if [ -z "${ROS_IFACE_NAMES:-}" ] || [ "$(wc -w <<< "${ROS_IFACE_NAMES:-}")" -ne "$count_if" ]; then
+    ROS_IFACE_NAMES="$(derive_ros_iface_names)"
+  fi
+  validate_name_list "RouterOS 网口名称列表" is_ros_ifname "$ROS_IFACE_NAMES" || ok_flag=1
   [ "$ok_flag" -eq 0 ]
 }
 
 validate_routeros_config(){
-  local ok_flag=0 dns dns_trim start_int end_int lan_net start_net end_net item _dns_list
+  local ok_flag=0 dns dns_trim start_int end_int lan_net start_net end_net item ros_count vm_count _dns_list
   [ -n "${ROS_IDENTITY:-}" ] || { err "RouterOS identity 不能为空。"; ok_flag=1; }
   is_ros_ifname "$ROS_WAN_IFACE" || { err "WAN 口名称非法: $ROS_WAN_IFACE"; ok_flag=1; }
   is_ros_ifname "$ROS_LAN_BRIDGE" || { err "LAN bridge 名称非法: $ROS_LAN_BRIDGE"; ok_flag=1; }
@@ -351,6 +413,13 @@ validate_routeros_config(){
       ok_flag=1
     fi
   done
+  validate_name_list "RouterOS 网口名称列表" is_ros_ifname "${ROS_IFACE_NAMES:-}" || ok_flag=1
+  ros_count="$(wc -w <<< "${ROS_IFACE_NAMES:-}")"
+  vm_count="$(wc -w <<< "${VM_IFACES:-}")"
+  if [ "$vm_count" -gt 0 ] && [ "$ros_count" -ne "$vm_count" ]; then
+    err "RouterOS 网口名称数量必须和 virtio-net 数量一致: RouterOS=$ros_count, virtio-net=$vm_count"
+    ok_flag=1
+  fi
   is_ipv4 "$ROS_LAN_IP" || { err "LAN IP 非法: $ROS_LAN_IP"; ok_flag=1; }
   is_prefix "$ROS_LAN_PREFIX" || { err "LAN 掩码前缀非法: $ROS_LAN_PREFIX"; ok_flag=1; }
   is_ipv4 "$ROS_DHCP_START" || { err "DHCP 起始地址非法: $ROS_DHCP_START"; ok_flag=1; }
@@ -390,6 +459,7 @@ save_config(){
     printf 'VM_BRIDGES=%q\n' "$VM_BRIDGES"
     printf 'VM_TAPS=%q\n' "$VM_TAPS"
     printf 'VM_MACS=%q\n' "$VM_MACS"
+    printf 'ROS_IFACE_NAMES=%q\n' "$ROS_IFACE_NAMES"
     printf 'PERSIST_HOST_NET=%q\n' "$PERSIST_HOST_NET"
     printf 'HOST_NET_MODE=%q\n' "$HOST_NET_MODE"
     printf 'ALLOW_DANGEROUS_IFACES=%q\n' "$ALLOW_DANGEROUS_IFACES"
@@ -409,16 +479,18 @@ save_config(){
 }
 
 load_config(){
+  local config_has_ros_iface_names=0
   IMAGE_PATH="/root/routeros.img"
   DISK_FORMAT="raw"
   QEMU_BIN="qemu-system-aarch64"
   VM_CPUS="$(nproc 2>/dev/null || echo 4)"
   VM_MEMORY_MB="1024"
   NET_QUEUES="4"
-  VM_IFACES="eth1 eth2 eth3"
-  VM_BRIDGES="br-ros1 br-ros2 br-ros3"
-  VM_TAPS="tap-ros1 tap-ros2 tap-ros3"
-  VM_MACS="52:54:00:21:00:01 52:54:00:21:00:02 52:54:00:21:00:03"
+  VM_IFACES="eth0 eth1 eth2 eth3"
+  VM_BRIDGES="br-ros1 br-ros2 br-ros3 br-ros4"
+  VM_TAPS="tap-ros1 tap-ros2 tap-ros3 tap-ros4"
+  VM_MACS="52:54:00:21:00:01 52:54:00:21:00:02 52:54:00:21:00:03 52:54:00:21:00:04"
+  ROS_IFACE_NAMES=""
   PERSIST_HOST_NET="1"
   HOST_NET_MODE=""
   ALLOW_DANGEROUS_IFACES=""
@@ -426,9 +498,9 @@ load_config(){
   MONITOR_SOCK="/run/routeros/monitor.sock"
   PID_FILE="/run/routeros/routeros-chr.pid"
   ROS_IDENTITY="CHR-R2"
-  ROS_WAN_IFACE="ether1"
+  ROS_WAN_IFACE="eth0"
   ROS_LAN_BRIDGE="br-lan"
-  ROS_LAN_PORTS="ether2 ether3"
+  ROS_LAN_PORTS="eth1 eth2 eth3"
   ROS_LAN_IP="10.10.10.1"
   ROS_LAN_PREFIX="24"
   ROS_DHCP_START="10.10.10.100"
@@ -436,6 +508,7 @@ load_config(){
   ROS_DNS_SERVERS="223.5.5.5,119.29.29.29"
 
   if [ -r "$CONFIG_FILE" ]; then
+    grep -Eq '^ROS_IFACE_NAMES=' "$CONFIG_FILE" 2>/dev/null && config_has_ros_iface_names=1
     # shellcheck disable=SC1090
     . "$CONFIG_FILE"
   fi
@@ -444,6 +517,12 @@ load_config(){
       HOST_NET_MODE="networkd"
     else
       HOST_NET_MODE="runtime"
+    fi
+  fi
+  if [ -z "${ROS_IFACE_NAMES:-}" ] || [ "$(wc -w <<< "${ROS_IFACE_NAMES:-}")" -ne "$(wc -w <<< "${VM_IFACES:-}")" ]; then
+    ROS_IFACE_NAMES="$(derive_ros_iface_names)"
+    if [ "$config_has_ros_iface_names" -eq 0 ] || [[ "${ROS_WAN_IFACE:-}" =~ ^ether[0-9]+$ ]]; then
+      sync_routeros_defaults_from_vm
     fi
   fi
 }
@@ -808,7 +887,7 @@ choose_image_from_root(){
 
 choose_host_ifaces(){
   local -a phys chosen
-  local count def iface i macs bridges taps input duplicate
+  local count def iface i macs bridges taps input duplicate ros_names ros_name
   phys=()
   chosen=()
   while IFS= read -r iface; do
@@ -824,16 +903,20 @@ choose_host_ifaces(){
     done
   fi
 
-  count="$(read_default "给 RouterOS 配置几个 virtio-net 网口" "3")"
-  count="$(normalize_uint "virtio-net 网口数量" "$count" "3" 1 16)"
+  count="$(read_default "给 RouterOS 配置几个 virtio-net 网口" "4")"
+  count="$(normalize_uint "virtio-net 网口数量" "$count" "4" 1 16)"
 
   for ((i=1; i<=count; i++)); do
-    case "$i" in
-      1) def="eth1" ;;
-      2) def="eth2" ;;
-      3) def="eth3" ;;
-      *) def="" ;;
-    esac
+    def="${phys[$((i-1))]:-}"
+    if [ -z "$def" ]; then
+      case "$i" in
+        1) def="eth0" ;;
+        2) def="eth1" ;;
+        3) def="eth2" ;;
+        4) def="eth3" ;;
+        *) def="" ;;
+      esac
+    fi
     while true; do
       input="$(read_default "第 $i 个 virtio-net 绑定的宿主机物理网口，输入 none 表示只建内部桥" "$def")"
       input="$(trim "$input")"
@@ -871,15 +954,13 @@ choose_host_ifaces(){
   VM_TAPS="${taps[*]}"
   VM_MACS="${macs[*]}"
 
-  ROS_WAN_IFACE="ether1"
-  if [ "$count" -ge 2 ]; then
-    ROS_LAN_PORTS=""
-    for ((i=2; i<=count; i++)); do
-      ROS_LAN_PORTS="${ROS_LAN_PORTS:+$ROS_LAN_PORTS }ether$i"
-    done
-  else
-    ROS_LAN_PORTS=""
-  fi
+  ros_names=()
+  for ((i=1; i<=count; i++)); do
+    ros_name="$(default_ros_name_for_slot "$i" "${chosen[$((i-1))]}")"
+    ros_names+=("$ros_name")
+  done
+  ROS_IFACE_NAMES="$(join_words "${ros_names[@]}")"
+  sync_routeros_defaults_from_vm
 
   confirm_host_iface_takeover
 }
@@ -1564,6 +1645,8 @@ menu_vm_config(){
   printf '%s\n' "镜像: $IMAGE_PATH ($DISK_FORMAT)"
   printf '%s\n' "CPU/内存: ${VM_CPUS} vCPU / ${VM_MEMORY_MB} MB"
   printf '%s\n' "宿主机网口: $VM_IFACES"
+  printf '%s\n' "RouterOS 网口: $ROS_IFACE_NAMES"
+  printf '%s\n' "RouterOS 预设: WAN=$ROS_WAN_IFACE, LAN=${ROS_LAN_PORTS:-无}"
   printf '%s\n' "桥/tap: $VM_BRIDGES / $VM_TAPS"
   printf '%s\n' "宿主机网络持久化: $HOST_NET_MODE"
   warn "如果选中的网口原来属于宿主机网络，启动 RouterOS 时会被接管，宿主机不再直接在这些网口上拿 IP。"
@@ -1603,14 +1686,31 @@ ros_quote(){
 
 build_preset_rsc(){
   mkdir -p "$CONFIG_DIR"
+  if [ -z "${ROS_IFACE_NAMES:-}" ]; then
+    ROS_IFACE_NAMES="$(derive_ros_iface_names)"
+  fi
   validate_routeros_config || return 1
-  local network lan_cidr identity_q wan_q bridge_q dns_clean lan_port_cmds port port_q
+  local network lan_cidr identity_q wan_q bridge_q dns_clean rename_cmds lan_port_cmds index iface iface_q default_name default_q port port_q
   network="$(cidr_network "$ROS_LAN_IP" "$ROS_LAN_PREFIX")"
   lan_cidr="$network/$ROS_LAN_PREFIX"
   identity_q="$(ros_quote "$ROS_IDENTITY")"
   wan_q="$(ros_quote "$ROS_WAN_IFACE")"
   bridge_q="$(ros_quote "$ROS_LAN_BRIDGE")"
   dns_clean="$(strip_spaces "$ROS_DNS_SERVERS")"
+  rename_cmds=""
+  index=1
+  for iface in $ROS_IFACE_NAMES; do
+    iface_q="$(ros_quote "$iface")"
+    default_name="ether$index"
+    default_q="$(ros_quote "$default_name")"
+    if [ "$iface" != "$default_name" ]; then
+      rename_cmds+=$(printf ':do { /interface ethernet set [find default-name=%s] name=%s comment="routerosinstall: mapped from %s" } on-error={}' "$default_q" "$iface_q" "$default_name")
+      rename_cmds+=$'\n'
+    fi
+    rename_cmds+=$(printf ':do { /interface ethernet set [find name=%s] comment="routerosinstall: mapped interface" } on-error={}' "$iface_q")
+    rename_cmds+=$'\n'
+    index=$((index + 1))
+  done
   lan_port_cmds=""
   for port in $ROS_LAN_PORTS; do
     port_q="$(ros_quote "$port")"
@@ -1627,7 +1727,7 @@ build_preset_rsc(){
 
 /system identity set name=$identity_q
 
-:do { /interface ethernet set [find default-name=$wan_q] name=$wan_q comment="routerosinstall: WAN" } on-error={}
+$rename_cmds
 :do { /interface ethernet set [find name=$wan_q] comment="routerosinstall: WAN" } on-error={}
 :do { /interface bridge add name=$bridge_q comment="routerosinstall: LAN bridge" protocol-mode=rstp } on-error={}
 :do { /interface bridge set [find name=$bridge_q] comment="routerosinstall: LAN bridge" protocol-mode=rstp } on-error={}
@@ -1680,6 +1780,7 @@ EOF_RSC
 show_routeros_preset_values(){
   printf '%s\n' "当前 RouterOS 预设置:"
   printf '  %-18s %s\n' "identity" "$ROS_IDENTITY"
+  printf '  %-18s %s\n' "iface names" "${ROS_IFACE_NAMES:-自动从 VM 网口推导}"
   printf '  %-18s %s\n' "WAN" "$ROS_WAN_IFACE DHCP"
   printf '  %-18s %s\n' "LAN bridge" "$ROS_LAN_BRIDGE"
   printf '  %-18s %s\n' "LAN ports" "${ROS_LAN_PORTS:-无}"
@@ -1692,6 +1793,10 @@ edit_routeros_preset(){
   show_routeros_preset_values
   printf '\n'
   ROS_IDENTITY="$(read_default "RouterOS identity" "$ROS_IDENTITY")"
+  ROS_IFACE_NAMES="$(read_default "RouterOS 网口名称列表，按 virtio-net 顺序，用空格分隔" "$ROS_IFACE_NAMES")"
+  if confirm "是否根据 RouterOS 网口名称列表自动更新 WAN/LAN 默认值" "y"; then
+    sync_routeros_defaults_from_vm
+  fi
   ROS_WAN_IFACE="$(read_default "WAN 口名称" "$ROS_WAN_IFACE")"
   ROS_LAN_BRIDGE="$(read_default "LAN bridge 名称" "$ROS_LAN_BRIDGE")"
   ROS_LAN_PORTS="$(read_default "LAN 口列表，用空格分隔" "$ROS_LAN_PORTS")"

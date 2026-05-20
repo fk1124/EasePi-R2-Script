@@ -111,8 +111,8 @@ sudo routerosinstall
 1. 进入 `1. 依赖安装`，检查并安装 KVM、QEMU、socat、unzip 等依赖。
 2. 进入 `2. 网络检查`，确认当前管理口不要被拿去给 RouterOS 使用。
 3. 进入 `3. 虚拟机参数配置`，选择 `/root/routeros.img`，设置 CPU、内存、virtio-net 网口和宿主机网口。
-4. 进入 `4. RouterOS 预设置`，生成或应用 WAN、LAN、DHCP、NAT 配置。
-5. 进入 `5. RouterOS 启动/关闭/卸载/开机自启动设置`，启动 RouterOS，并按需设置开机自启动。
+4. 进入 `5. RouterOS 启动/关闭/卸载/开机自启动设置`，启动 RouterOS，并按需设置开机自启动。
+5. 进入 `4. RouterOS 预设置`，先确认预设值，再通过 SSH 或串口 socket 应用 WAN、LAN、DHCP、NAT 配置。
 
 RK3588 / EasePi-R2 常用配置示例：
 
@@ -121,18 +121,19 @@ RK3588 / EasePi-R2 常用配置示例：
 CPU: 8
 内存: 1024 MB 或 2048 MB
 virtio-net 队列: 4
-第 1 个 virtio-net: eth1，作为 RouterOS ether1 / WAN
-第 2 个 virtio-net: eth2，作为 RouterOS ether2 / LAN
-第 3 个 virtio-net: eth3，作为 RouterOS ether3 / LAN
+第 1 个 virtio-net: eth0，RouterOS 内重命名为 eth0，作为 WAN
+第 2 个 virtio-net: eth1，RouterOS 内重命名为 eth1，作为 LAN
+第 3 个 virtio-net: eth2，RouterOS 内重命名为 eth2，作为 LAN
+第 4 个 virtio-net: eth3，RouterOS 内重命名为 eth3，作为 LAN
 宿主机网络持久化模式: networkd
 ```
 
 默认 RouterOS 预设置：
 
 ```text
-WAN: ether1，DHCP 获取上级地址
+WAN: eth0，DHCP 获取上级地址
 LAN bridge: br-lan
-LAN ports: ether2 ether3
+LAN ports: eth1 eth2 eth3
 LAN IP: 10.10.10.1/24
 DHCP: 10.10.10.100-10.10.10.200
 NAT: LAN 出口 masquerade 到 WAN
@@ -141,8 +142,8 @@ NAT: LAN 出口 masquerade 到 WAN
 接线测试时可以这样接：
 
 ```text
-上级网线 -> EasePi-R2 eth1 -> RouterOS WAN
-下级设备 -> EasePi-R2 eth2 或 eth3 -> RouterOS LAN
+上级网线 -> EasePi-R2 eth0 -> RouterOS WAN
+下级设备 -> EasePi-R2 eth1/eth2/eth3 -> RouterOS LAN
 ```
 
 下级设备应能拿到 `10.10.10.x` 地址，并通过 `http://10.10.10.1/` 访问 RouterOS WebFig。
