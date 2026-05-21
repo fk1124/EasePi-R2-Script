@@ -4,36 +4,18 @@ EasePi-R2 常用中文脚本集合。仓库根目录下的 `*.sh` 会被 `EasePi
 
 ## 快速下载
 
-推荐用 `git clone`，比 `raw.githubusercontent.com` 单文件下载更稳：
+在 EasePi-R2 终端里直接执行下面这一行即可。默认已经是 `root`，命令会把本仓库根目录下所有 `.sh` 脚本下载到 `/root/`，并自动加执行权限。
 
 ```bash
-sudo -i
-cd /root
-git clone --depth=1 https://github.com/fk1124/EasePi-R2-Script.git /tmp/EasePi-R2-Script
-cp -f /tmp/EasePi-R2-Script/0.sh /tmp/EasePi-R2-Script/1.sh /tmp/EasePi-R2-Script/9.sh /root/
-chmod +x /root/0.sh /root/1.sh /root/9.sh
+cd /root && rm -rf /tmp/EasePi-R2-Script && git clone --depth=1 https://github.com/fk1124/EasePi-R2-Script.git /tmp/EasePi-R2-Script && cp -f /tmp/EasePi-R2-Script/*.sh /root/ && chmod +x /root/*.sh
 ```
 
-如果只想下载单个脚本，用 `curl -fL -o`，失败会直接报错：
+下载后按需要执行：
 
 ```bash
-sudo -i
-cd /root
-curl -fL --retry 3 -o 0.sh https://github.com/fk1124/EasePi-R2-Script/raw/refs/heads/main/0.sh
-curl -fL --retry 3 -o 1.sh https://github.com/fk1124/EasePi-R2-Script/raw/refs/heads/main/1.sh
-curl -fL --retry 3 -o 9.sh https://github.com/fk1124/EasePi-R2-Script/raw/refs/heads/main/9.sh
-chmod +x /root/0.sh /root/1.sh /root/9.sh
-```
-
-如果 GitHub raw 下载不稳定，可以试试 CDN 备用地址：
-
-```bash
-sudo -i
-cd /root
-curl -fL --retry 3 -o 0.sh https://cdn.jsdelivr.net/gh/fk1124/EasePi-R2-Script@main/0.sh
-curl -fL --retry 3 -o 1.sh https://cdn.jsdelivr.net/gh/fk1124/EasePi-R2-Script@main/1.sh
-curl -fL --retry 3 -o 9.sh https://cdn.jsdelivr.net/gh/fk1124/EasePi-R2-Script@main/9.sh
-chmod +x /root/0.sh /root/1.sh /root/9.sh
+bash 0.sh
+bash 1.sh
+bash 9.sh
 ```
 
 ## 脚本索引
