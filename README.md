@@ -4,20 +4,43 @@ EasePi-R2 常用中文脚本集合。仓库根目录下的 `*.sh` 会被 `EasePi
 
 ## 快速下载
 
+推荐用 `git clone`，比 `raw.githubusercontent.com` 单文件下载更稳：
+
 ```bash
 sudo -i
 cd /root
-curl -L -O https://raw.githubusercontent.com/fk1124/EasePi-R2-Script/main/0.sh
-curl -L -O https://raw.githubusercontent.com/fk1124/EasePi-R2-Script/main/1.sh
-curl -L -O https://raw.githubusercontent.com/fk1124/EasePi-R2-Script/main/9.sh
-chmod +x /root/*.sh
+git clone --depth=1 https://github.com/fk1124/EasePi-R2-Script.git /tmp/EasePi-R2-Script
+cp -f /tmp/EasePi-R2-Script/0.sh /tmp/EasePi-R2-Script/1.sh /tmp/EasePi-R2-Script/9.sh /root/
+chmod +x /root/0.sh /root/1.sh /root/9.sh
+```
+
+如果只想下载单个脚本，用 `curl -fL -o`，失败会直接报错：
+
+```bash
+sudo -i
+cd /root
+curl -fL --retry 3 -o 0.sh https://github.com/fk1124/EasePi-R2-Script/raw/refs/heads/main/0.sh
+curl -fL --retry 3 -o 1.sh https://github.com/fk1124/EasePi-R2-Script/raw/refs/heads/main/1.sh
+curl -fL --retry 3 -o 9.sh https://github.com/fk1124/EasePi-R2-Script/raw/refs/heads/main/9.sh
+chmod +x /root/0.sh /root/1.sh /root/9.sh
+```
+
+如果 GitHub raw 下载不稳定，可以试试 CDN 备用地址：
+
+```bash
+sudo -i
+cd /root
+curl -fL --retry 3 -o 0.sh https://cdn.jsdelivr.net/gh/fk1124/EasePi-R2-Script@main/0.sh
+curl -fL --retry 3 -o 1.sh https://cdn.jsdelivr.net/gh/fk1124/EasePi-R2-Script@main/1.sh
+curl -fL --retry 3 -o 9.sh https://cdn.jsdelivr.net/gh/fk1124/EasePi-R2-Script@main/9.sh
+chmod +x /root/0.sh /root/1.sh /root/9.sh
 ```
 
 ## 脚本索引
 
 | 脚本 | 状态 | 用途 |
 | --- | --- | --- |
-| `0.sh` | 可用 | Debian / Armbian 宿主基础网络、SSH、APT 源、路由配置 |
+| `0.sh` | 可用 | EasePi-R2 Debian / Armbian 宿主网络管理 |
 | `1.sh` | 可用 | 创建并切换到 OpenWrt LXC 宿主网络方案 |
 | `2.sh` | 预留 | 待定义 |
 | `3.sh` | 预留 | 待定义 |
@@ -31,14 +54,32 @@ chmod +x /root/*.sh
 ## 使用说明
 
 <details>
-<summary><code>0.sh</code>：EasePi-R2 基础网络和宿主初始化</summary>
+<summary><code>0.sh</code>：EasePi-R2 宿主网络管理脚本</summary>
 
-### 适用场景
+### 脚本定位
 
-- Debian / Armbian / EasePi-R2-LiteHost 宿主系统首次初始化。
-- 配置 WAN、LAN、DHCP、DNS、NAT、WiFi 客户端/热点、LTE 管理口。
-- 开启 SSH root 密码登录、切换国内 APT 源、安装基础网络依赖。
-- 扩展 rootfs、查看网络状态、备份和恢复脚本管理的配置。
+`0.sh` 是 EasePi-R2 的宿主网络管理菜单，主要管理 Debian / Armbian 系统里的这些组件：
+
+- `systemd-networkd`：管理网口、网桥、默认路由。
+- `dnsmasq`：给 LAN 侧发 DHCP，并提供本地 DNS。
+- `nftables`：配置 NAT 出口和转发规则。
+- `wpa_supplicant`：配置 WiFi 客户端模式。
+- `hostapd`：配置 WiFi 热点模式。
+- `sshd`：开启或调整 SSH root 登录。
+
+### 主要功能
+
+- 查看当前网口、IP、路由、DNS 和服务状态。
+- 配置 WAN：支持 DHCP、静态地址、禁用、metric 调整。
+- 配置 LAN：创建或调整 `br-lan`，绑定 LAN 网口。
+- 配置 DHCP：设置 LAN 地址池、网关、DNS 下发。
+- 配置 DNS：设置宿主 DNS 和 `dnsmasq` 上游 DNS。
+- 配置 NAT：用 `nftables` 给 LAN 侧设备共享 WAN 出口。
+- 配置 WiFi：支持客户端模式和热点模式。
+- 配置 LTE 管理口：保留 LTE 地址访问 SSH，不默认抢主路由。
+- 安装基础网络依赖。
+- 扩展 rootfs。
+- 备份和恢复脚本管理过的网络配置。
 
 ### 执行方式
 
@@ -47,6 +88,18 @@ sudo -i
 cd /root
 bash 0.sh
 ```
+
+### 适合什么时候用
+
+- 刚刷好 Debian / Armbian / EasePi-R2-LiteHost，需要配置宿主网络。
+- 需要把 EasePi-R2 当普通路由宿主使用。
+- 需要快速调整 WAN、LAN、DHCP、DNS、NAT。
+- 需要临时查看网络状态或恢复脚本生成的配置。
+
+### 不适合什么时候用
+
+- 已经决定让 OpenWrt LXC 完全接管物理网口时，最终应使用 `1.sh` 完成切网。
+- 不想改宿主网络服务时，不要随便进入写配置的菜单项。
 
 ### 主要持久化配置
 
@@ -207,7 +260,7 @@ cat /etc/resolv.conf
 ```bash
 sudo -i
 cd /root
-curl -L -o chr-arm64.img.zip https://download.mikrotik.com/routeros/7.22.3/chr-7.22.3-arm64.img.zip
+curl -fL --retry 3 -o chr-arm64.img.zip https://download.mikrotik.com/routeros/7.22.3/chr-7.22.3-arm64.img.zip
 apt-get update
 apt-get install -y unzip
 unzip -p chr-arm64.img.zip > /root/routeros.img
