@@ -66,7 +66,6 @@ bash 9.sh
 ### 执行方式
 
 ```bash
-sudo -i
 cd /root
 bash 0.sh
 ```
@@ -126,7 +125,6 @@ OpenWrt rootfs：上海交通大学 SJTUG OpenWrt 镜像
 ### 执行方式
 
 ```bash
-sudo -i
 cd /root
 bash 1.sh
 ```
@@ -240,7 +238,6 @@ cat /etc/resolv.conf
 到 MikroTik 官方下载 ARM64 CHR 镜像，或在宿主执行：
 
 ```bash
-sudo -i
 cd /root
 curl -fL --retry 3 -o chr-arm64.img.zip https://download.mikrotik.com/routeros/7.22.3/chr-7.22.3-arm64.img.zip
 apt-get update
@@ -252,7 +249,6 @@ chmod 600 /root/routeros.img
 ### 执行方式
 
 ```bash
-sudo -i
 cd /root
 bash 9.sh
 sudo routerosinstall
