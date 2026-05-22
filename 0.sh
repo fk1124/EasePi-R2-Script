@@ -20,6 +20,9 @@ WPA_DIR="/etc/wpa_supplicant"
 LTE_POLICY_SCRIPT="/usr/local/sbin/easepi-r2-lte4g-policy-route.sh"
 LTE_POLICY_SERVICE="/etc/systemd/system/easepi-r2-lte4g-policy-route.service"
 LTE_POLICY_TIMER="/etc/systemd/system/easepi-r2-lte4g-policy-route.timer"
+LTE_MANAGER_SCRIPT="/usr/local/sbin/easepi-r2-lte4g-manager.sh"
+LTE_MANAGER_SERVICE="/etc/systemd/system/easepi-r2-lte4g-manager.service"
+LTE_MANAGER_TIMER="/etc/systemd/system/easepi-r2-lte4g-manager.timer"
 LTE_POLICY_TABLE="${LTE_POLICY_TABLE:-1004}"
 LTE_POLICY_PRIO="${LTE_POLICY_PRIO:-1004}"
 
@@ -648,6 +651,9 @@ backup_now(){
   cp -a "$LTE_POLICY_SCRIPT" "$target/lte4g-policy-route.sh" 2>/dev/null || true
   cp -a "$LTE_POLICY_SERVICE" "$target/lte4g-policy-route.service" 2>/dev/null || true
   cp -a "$LTE_POLICY_TIMER" "$target/lte4g-policy-route.timer" 2>/dev/null || true
+  cp -a "$LTE_MANAGER_SCRIPT" "$target/lte4g-manager.sh" 2>/dev/null || true
+  cp -a "$LTE_MANAGER_SERVICE" "$target/lte4g-manager.service" 2>/dev/null || true
+  cp -a "$LTE_MANAGER_TIMER" "$target/lte4g-manager.timer" 2>/dev/null || true
   ls -1dt "$BACKUP_DIR"/* 2>/dev/null | tail -n +6 | xargs -r rm -rf
   echo "$target"
 }
@@ -681,6 +687,9 @@ restore_backup(){
   cp -a "$target/lte4g-policy-route.sh" "$LTE_POLICY_SCRIPT" 2>/dev/null || true
   cp -a "$target/lte4g-policy-route.service" "$LTE_POLICY_SERVICE" 2>/dev/null || true
   cp -a "$target/lte4g-policy-route.timer" "$LTE_POLICY_TIMER" 2>/dev/null || true
+  cp -a "$target/lte4g-manager.sh" "$LTE_MANAGER_SCRIPT" 2>/dev/null || true
+  cp -a "$target/lte4g-manager.service" "$LTE_MANAGER_SERVICE" 2>/dev/null || true
+  cp -a "$target/lte4g-manager.timer" "$LTE_MANAGER_TIMER" 2>/dev/null || true
   if [ -r "$target/easepi-r2-script/网络配置.env" ]; then
     mkdir -p "$BASE_DIR"
     cp -a "$target/easepi-r2-script/网络配置.env" "$CONFIG_FILE"
@@ -987,6 +996,184 @@ apply_lte4g_ipv6_ra_sysctl(){
   sysctl -w net.ipv6.conf.lte4g.autoconf=1 >/dev/null 2>&1 || true
 }
 
+write_lte4g_manager_files(){
+  mkdir -p "$(dirname "$LTE_MANAGER_SCRIPT")" "$(dirname "$LTE_MANAGER_SERVICE")"
+  cat > "$LTE_MANAGER_SCRIPT" <<'EOF_LTE_MANAGER'
+#!/usr/bin/env bash
+set -u
+
+IFACE="${1:-lte4g}"
+VID="${EASEPI_R2_ML307R_VID:-2ecc}"
+PID="${EASEPI_R2_ML307R_PID:-3012}"
+NEW_ID="/sys/bus/usb-serial/drivers/option1/new_id"
+APN="${EASEPI_R2_LTE4G_APN:-}"
+AT_PORT=""
+LOG_TAG="easepi-r2-lte4g-manager"
+
+log(){
+  logger -t "$LOG_TAG" "$*" 2>/dev/null || true
+  printf '%s\n' "$*"
+}
+
+ml307r_present(){
+  local vendor_path device_dir
+  for vendor_path in /sys/bus/usb/devices/*/idVendor; do
+    [ -r "$vendor_path" ] || continue
+    device_dir="${vendor_path%/idVendor}"
+    [ "$(cat "$vendor_path" 2>/dev/null)" = "$VID" ] || continue
+    [ -r "$device_dir/idProduct" ] || continue
+    [ "$(cat "$device_dir/idProduct" 2>/dev/null)" = "$PID" ] || continue
+    return 0
+  done
+  return 1
+}
+
+bind_ml307r_at(){
+  modprobe usbserial 2>/dev/null || true
+  modprobe usb_wwan 2>/dev/null || true
+  modprobe option 2>/dev/null || true
+  if ml307r_present && [ -w "$NEW_ID" ]; then
+    { printf '%s %s\n' "$VID" "$PID" > "$NEW_ID"; } 2>/dev/null || true
+  fi
+}
+
+at_send_raw(){
+  local port="$1" cmd="$2" out
+  [ -c "$port" ] || return 1
+  stty -F "$port" 115200 raw -echo -echoe -echok -crtscts -ixon -ixoff min 0 time 10 2>/dev/null || true
+  exec 3<>"$port" || return 1
+  dd if="$port" of=/dev/null bs=512 count=1 iflag=nonblock 2>/dev/null || true
+  printf '%s\r' "$cmd" >&3
+  out="$(timeout 8 cat <&3 2>/dev/null | tr '\r' '\n' | sed '/^$/d')"
+  exec 3>&- 3<&-
+  printf '%s\n' "$out"
+}
+
+at_try(){
+  local cmd="$1" out one_line
+  out="$(at_send_raw "$AT_PORT" "$cmd" 2>/dev/null || true)"
+  one_line="$(printf '%s' "$out" | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')"
+  log "AT $cmd => ${one_line:-no response}"
+  printf '%s\n' "$out" | grep -q 'OK'
+}
+
+find_at_port(){
+  local i port out
+  for i in $(seq 1 30); do
+    for port in /dev/ttyUSB2 /dev/ttyUSB0 /dev/ttyUSB1 /dev/ttyUSB3 /dev/ttyUSB4; do
+      [ -c "$port" ] || continue
+      out="$(at_send_raw "$port" AT 2>/dev/null || true)"
+      if printf '%s\n' "$out" | grep -q 'OK'; then
+        printf '%s\n' "$port"
+        return 0
+      fi
+    done
+    sleep 1
+  done
+  return 1
+}
+
+wait_for_iface(){
+  local i
+  for i in $(seq 1 30); do
+    [ -d "/sys/class/net/$IFACE" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+configure_ml307r(){
+  at_try ATE0 || true
+  at_try AT+CGATT=1 || true
+  if [ -n "$APN" ]; then
+    at_try "AT+CGDCONT=1,\"IPV4V6\",\"$APN\"" || true
+  fi
+  at_try 'AT*NETIF=1' || true
+  at_try 'AT*NETACT=1,1,1' || true
+  at_try 'AT+MDIALUPCFG="auto",1' || true
+  at_try 'AT*DIALMODE=1' || true
+  at_try 'AT+MDIALUP=1,1' || true
+}
+
+refresh_lte_network(){
+  local i
+  sysctl -w "net.ipv6.conf.$IFACE.accept_ra=2" >/dev/null 2>&1 || true
+  sysctl -w "net.ipv6.conf.$IFACE.autoconf=1" >/dev/null 2>&1 || true
+  if command -v networkctl >/dev/null 2>&1; then
+    networkctl reconfigure "$IFACE" >/dev/null 2>&1 || true
+  fi
+  for i in $(seq 1 30); do
+    ip -4 -o addr show dev "$IFACE" scope global >/dev/null 2>&1 && \
+      ip -6 -o addr show dev "$IFACE" scope global >/dev/null 2>&1 && break
+    sleep 1
+  done
+  if [ -x /usr/local/sbin/easepi-r2-lte4g-policy-route.sh ]; then
+    /usr/local/sbin/easepi-r2-lte4g-policy-route.sh "$IFACE" 1004 1004 >/dev/null 2>&1 || true
+  fi
+}
+
+main(){
+  local stopped_mm=0
+  bind_ml307r_at
+  wait_for_iface || log "$IFACE not found; skip LTE manager"
+
+  AT_PORT="$(find_at_port 2>/dev/null || true)"
+  if [ -z "$AT_PORT" ] && systemctl is-active --quiet ModemManager.service 2>/dev/null; then
+    stopped_mm=1
+    systemctl stop ModemManager.service >/dev/null 2>&1 || true
+    sleep 2
+    AT_PORT="$(find_at_port 2>/dev/null || true)"
+  fi
+
+  if [ -n "$AT_PORT" ]; then
+    log "using AT port $AT_PORT"
+    configure_ml307r
+  else
+    log "no ML307R AT port found; only refresh network routes"
+  fi
+
+  refresh_lte_network
+
+  if [ "$stopped_mm" -eq 1 ] && [ "${EASEPI_R2_LTE4G_RESTART_MODEMMANAGER:-no}" = yes ]; then
+    systemctl start ModemManager.service >/dev/null 2>&1 || true
+  fi
+}
+
+main "$@"
+EOF_LTE_MANAGER
+  chmod 755 "$LTE_MANAGER_SCRIPT"
+
+  cat > "$LTE_MANAGER_SERVICE" <<EOF_LTE_MANAGER_SERVICE
+[Unit]
+Description=EasePi-R2 lte4g ML307R dial and management
+After=systemd-modules-load.service systemd-udevd.service
+Before=systemd-networkd.service ModemManager.service
+Wants=systemd-networkd.service
+
+[Service]
+Type=oneshot
+ExecStart=$LTE_MANAGER_SCRIPT lte4g
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target
+EOF_LTE_MANAGER_SERVICE
+
+  cat > "$LTE_MANAGER_TIMER" <<'EOF_LTE_MANAGER_TIMER'
+[Unit]
+Description=Refresh EasePi-R2 lte4g ML307R dial state
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=5min
+AccuracySec=15s
+Unit=easepi-r2-lte4g-manager.service
+
+[Install]
+WantedBy=timers.target
+EOF_LTE_MANAGER_TIMER
+}
+
 write_lte4g_policy_files(){
   mkdir -p "$(dirname "$LTE_POLICY_SCRIPT")" "$(dirname "$LTE_POLICY_SERVICE")"
   cat > "$LTE_POLICY_SCRIPT" <<'EOF_LTE_POLICY'
@@ -1095,6 +1282,20 @@ sync_lte4g_policy_service(){
   fi
 }
 
+sync_lte4g_manager_service(){
+  write_lte4g_manager_files
+  if wan_has_iface lte4g; then
+    systemctl daemon-reload || true
+    systemctl enable easepi-r2-lte4g-manager.service >/dev/null 2>&1 || true
+    systemctl enable --now easepi-r2-lte4g-manager.timer >/dev/null 2>&1 || true
+    systemctl start easepi-r2-lte4g-manager.service >/dev/null 2>&1 || true
+  else
+    systemctl disable --now easepi-r2-lte4g-manager.timer >/dev/null 2>&1 || true
+    systemctl disable easepi-r2-lte4g-manager.service >/dev/null 2>&1 || true
+    systemctl stop easepi-r2-lte4g-manager.service >/dev/null 2>&1 || true
+  fi
+}
+
 write_all_configs(){
   save_config
   write_dns_config
@@ -1102,6 +1303,7 @@ write_all_configs(){
   write_dnsmasq
   write_nft
   write_sysctl
+  write_lte4g_manager_files
   write_lte4g_policy_files
 }
 
@@ -1115,6 +1317,7 @@ reload_services(){
   systemctl enable systemd-networkd dnsmasq nftables >/dev/null 2>&1 || true
   systemctl disable systemd-networkd-wait-online.service >/dev/null 2>&1 || true
   systemctl mask systemd-networkd-wait-online.service >/dev/null 2>&1 || true
+  sync_lte4g_manager_service
   systemctl restart systemd-networkd 2>/dev/null || warn "systemd-networkd 重启失败，请查看 journalctl -u systemd-networkd"
   load_nft_rules || true
   systemctl restart dnsmasq 2>/dev/null || warn "dnsmasq 重启失败，请查看 journalctl -u dnsmasq"
@@ -1154,7 +1357,7 @@ show_network(){
   echo "------------------------------------------------------------"
   echo "服务："
   local svc unit
-  for svc in systemd-networkd dnsmasq nftables ssh sshd hostapd "wpa_supplicant@$WLAN_IFACE" easepi-r2-lte4g-policy-route.timer; do
+  for svc in systemd-networkd dnsmasq nftables ssh sshd hostapd "wpa_supplicant@$WLAN_IFACE" easepi-r2-lte4g-manager.timer easepi-r2-lte4g-policy-route.timer; do
     case "$svc" in
       *.service|*.timer) unit="$svc" ;;
       *) unit="$svc.service" ;;
@@ -1295,6 +1498,7 @@ enable_lte4g(){
   fi
   guide_networkd_iface_conflicts lte4g
   write_all_configs
+  info "功能 10 会安装 lte4g manager：自动拨起 ML307R RNDIS，并刷新 IPv4/IPv6 管理入口路由。"
   info "lte4g 会通过 DHCPv4 + IPv6 RA 获取双栈地址；IPv4 不加入主默认路由。"
   info "脚本会启用 IPv4/IPv6 策略路由：从 LTE 地址进入 R2 的 SSH，回复包仍从 lte4g 返回。"
   confirm "是否立即重新加载服务？" y && reload_services
