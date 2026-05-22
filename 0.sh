@@ -696,6 +696,65 @@ clean_networkd_files(){
   rm -f "$NETWORK_DIR"/3[0-9]-r2-*.network "$NETWORK_DIR"/4[0-9]-r2-*.network
 }
 
+networkd_file_matches_iface(){
+  local file="$1" iface="$2" line value pattern in_match=0
+  [ -r "$file" ] || return 1
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    line="$(trim "$line")"
+    case "$line" in
+      "[Match]") in_match=1; continue ;;
+      "["*) in_match=0; continue ;;
+    esac
+    [ "$in_match" -eq 1 ] || continue
+    case "$line" in
+      Name=*)
+        value="${line#Name=}"
+        for pattern in $value; do
+          [[ "$iface" == $pattern ]] && return 0
+        done
+        ;;
+    esac
+  done < "$file"
+  return 1
+}
+
+networkd_iface_conflicts(){
+  local iface="$1" file base
+  for file in "$NETWORK_DIR"/*.network; do
+    [ -e "$file" ] || continue
+    base="$(basename "$file")"
+    case "$base" in
+      [2-4][0-9]-r2-*.network|*.easepi-r2-script-disabled*) continue ;;
+    esac
+    networkd_file_matches_iface "$file" "$iface" && printf '%s\n' "$file"
+  done | sort
+}
+
+guide_networkd_iface_conflicts(){
+  local iface="$1" file disabled stamp
+  local -a conflicts=()
+  mapfile -t conflicts < <(networkd_iface_conflicts "$iface")
+  [ "${#conflicts[@]}" -eq 0 ] && return 0
+
+  warn "检测到已有 systemd-networkd 配置会匹配 $iface。"
+  warn "networkd 会优先使用排序靠前的 .network 文件，旧规则可能导致本脚本生成的配置不生效。"
+  for file in "${conflicts[@]}"; do
+    echo "  - $file"
+  done
+  warn "建议禁用这些旧 .network 文件；脚本只会改名备份，不会直接删除。"
+  if confirm "是否现在禁用这些冲突规则？" y; then
+    stamp="$(date +%Y%m%d%H%M%S)"
+    for file in "${conflicts[@]}"; do
+      [ -e "$file" ] || continue
+      disabled="${file}.easepi-r2-script-disabled-${stamp}"
+      mv -n "$file" "$disabled" && ok "已禁用：$file -> $disabled"
+    done
+  else
+    warn "已保留旧规则；如果 $iface 没有按预期获取地址，请回到本功能并同意禁用冲突规则。"
+  fi
+}
+
 write_dns_config(){
   mkdir -p "$RESOLVED_DIR"
   {
@@ -761,8 +820,10 @@ EOF_LAN
     [ "${mode:-dhcp}" = disabled ] && continue
     metric="${metric:-100}"
     dns_list="${dns_list:-$DEVICE_DNS}"
+    local network_file
     if [ "$mode" = static ]; then
-      cat > "$NETWORK_DIR/$(printf '%02d' "$idx")-r2-wan-$ifname.network" <<EOF_WAN_STATIC
+      network_file="$NETWORK_DIR/$(printf '%02d' "$idx")-r2-wan-$ifname.network"
+      cat > "$network_file" <<EOF_WAN_STATIC
 [Match]
 Name=$ifname
 
@@ -780,7 +841,8 @@ Gateway=$gateway
 Metric=$metric
 EOF_WAN_STATIC
     else
-      cat > "$NETWORK_DIR/$(printf '%02d' "$idx")-r2-wan-$ifname.network" <<EOF_WAN_DHCP
+      network_file="$NETWORK_DIR/$(printf '%02d' "$idx")-r2-wan-$ifname.network"
+      cat > "$network_file" <<EOF_WAN_DHCP
 [Match]
 Name=$ifname
 
@@ -788,15 +850,27 @@ Name=$ifname
 RequiredForOnline=no
 
 [Network]
-DHCP=ipv4
-IPv6AcceptRA=no
-LinkLocalAddressing=no
+DHCP=$(if [ "$ifname" = lte4g ]; then echo yes; else echo ipv4; fi)
+IPv6AcceptRA=$(if [ "$ifname" = lte4g ]; then echo yes; else echo no; fi)
+LinkLocalAddressing=$(if [ "$ifname" = lte4g ]; then echo ipv6; else echo no; fi)
 $(for d in $dns_list; do echo "DNS=$d"; done)
 
 [DHCPv4]
 UseDNS=no
 $(if [ "$ifname" = lte4g ]; then echo "UseRoutes=no"; echo "RouteMetric=$metric"; else echo "RouteMetric=$metric"; fi)
 EOF_WAN_DHCP
+      if [ "$ifname" = lte4g ]; then
+        cat >> "$network_file" <<EOF_LTE_RA
+
+[IPv6AcceptRA]
+UseDNS=no
+RouteMetric=$metric
+
+[DHCPv6]
+UseDNS=no
+WithoutRA=solicit
+EOF_LTE_RA
+      fi
     fi
     idx=$((idx+1))
   done <<< "$WAN_CONFIG"
@@ -907,6 +981,12 @@ net.ipv4.ip_forward=1
 EOF_SYSCTL
 }
 
+apply_lte4g_ipv6_ra_sysctl(){
+  [ -d /sys/class/net/lte4g ] || return 0
+  sysctl -w net.ipv6.conf.lte4g.accept_ra=2 >/dev/null 2>&1 || true
+  sysctl -w net.ipv6.conf.lte4g.autoconf=1 >/dev/null 2>&1 || true
+}
+
 write_lte4g_policy_files(){
   mkdir -p "$(dirname "$LTE_POLICY_SCRIPT")" "$(dirname "$LTE_POLICY_SERVICE")"
   cat > "$LTE_POLICY_SCRIPT" <<'EOF_LTE_POLICY'
@@ -918,10 +998,15 @@ TABLE="${2:-1004}"
 PRIO="${3:-1004}"
 
 [ -d "/sys/class/net/$IFACE" ] || exit 0
+sysctl -w "net.ipv6.conf.$IFACE.accept_ra=2" >/dev/null 2>&1 || true
+sysctl -w "net.ipv6.conf.$IFACE.autoconf=1" >/dev/null 2>&1 || true
 
-ADDR="$(ip -o -4 addr show dev "$IFACE" scope global 2>/dev/null | awk '{print $4; exit}')"
-[ -n "$ADDR" ] || exit 0
-ADDR_IP="${ADDR%/*}"
+ADDR4="$(ip -o -4 addr show dev "$IFACE" scope global 2>/dev/null | awk '{print $4; exit}')"
+ADDR4_IP="${ADDR4%/*}"
+
+ADDR6="$(ip -o -6 addr show dev "$IFACE" scope global 2>/dev/null | awk '!/ temporary / {print $4; exit}')"
+[ -n "$ADDR6" ] || ADDR6="$(ip -o -6 addr show dev "$IFACE" scope global 2>/dev/null | awk '{print $4; exit}')"
+ADDR6_IP="${ADDR6%/*}"
 
 IFINDEX="$(cat "/sys/class/net/$IFACE/ifindex" 2>/dev/null || true)"
 LEASE="/run/systemd/netif/leases/$IFINDEX"
@@ -931,15 +1016,39 @@ if [ -r "$LEASE" ]; then
   ROUTER="${ROUTER%% *}"
 fi
 [ -n "$ROUTER" ] || ROUTER="$(ip -4 route show default dev "$IFACE" 2>/dev/null | awk '{print $3; exit}')"
-[ -n "$ROUTER" ] || exit 0
+
+ROUTER6="$(ip -6 route show default dev "$IFACE" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')"
 
 while ip -4 rule del priority "$PRIO" 2>/dev/null; do :; done
+while ip -6 rule del priority "$PRIO" 2>/dev/null; do :; done
 ip -4 route flush table "$TABLE" 2>/dev/null || true
-ip -4 route show dev "$IFACE" scope link 2>/dev/null | while read -r route; do
-  [ -n "$route" ] && ip -4 route replace table "$TABLE" $route 2>/dev/null || true
-done
-ip -4 route replace default via "$ROUTER" dev "$IFACE" table "$TABLE"
-ip -4 rule add priority "$PRIO" from "$ADDR_IP/32" table "$TABLE"
+ip -6 route flush table "$TABLE" 2>/dev/null || true
+
+if [ -n "$ADDR4_IP" ] && [ -n "$ROUTER" ]; then
+  ip -4 route show dev "$IFACE" scope link 2>/dev/null | while read -r route; do
+    [ -n "$route" ] || continue
+    prefix="${route%% *}"
+    rest="${route#"$prefix"}"
+    ip -4 route replace "$prefix" dev "$IFACE" table "$TABLE" $rest 2>/dev/null || true
+  done
+  ip -4 route replace default via "$ROUTER" dev "$IFACE" table "$TABLE"
+  ip -4 rule add priority "$PRIO" from "$ADDR4_IP/32" table "$TABLE"
+fi
+
+if [ -n "$ADDR6_IP" ]; then
+  ip -6 route show dev "$IFACE" scope link 2>/dev/null | while read -r route; do
+    [ -n "$route" ] || continue
+    prefix="${route%% *}"
+    rest="${route#"$prefix"}"
+    ip -6 route replace "$prefix" dev "$IFACE" table "$TABLE" $rest 2>/dev/null || true
+  done
+  if [ -n "$ROUTER6" ]; then
+    ip -6 route replace default via "$ROUTER6" dev "$IFACE" table "$TABLE"
+  else
+    ip -6 route replace default dev "$IFACE" table "$TABLE" 2>/dev/null || true
+  fi
+  ip -6 rule add priority "$PRIO" from "$ADDR6_IP/128" table "$TABLE"
+fi
 exit 0
 EOF_LTE_POLICY
   chmod 755 "$LTE_POLICY_SCRIPT"
@@ -980,7 +1089,9 @@ sync_lte4g_policy_service(){
     systemctl disable --now easepi-r2-lte4g-policy-route.timer >/dev/null 2>&1 || true
     systemctl stop easepi-r2-lte4g-policy-route.service >/dev/null 2>&1 || true
     while ip -4 rule del priority "$LTE_POLICY_PRIO" 2>/dev/null; do :; done
+    while ip -6 rule del priority "$LTE_POLICY_PRIO" 2>/dev/null; do :; done
     ip -4 route flush table "$LTE_POLICY_TABLE" 2>/dev/null || true
+    ip -6 route flush table "$LTE_POLICY_TABLE" 2>/dev/null || true
   fi
 }
 
@@ -999,6 +1110,7 @@ reload_services(){
   load_config
   write_all_configs
   sysctl --system >/dev/null 2>&1 || true
+  wan_has_iface lte4g && apply_lte4g_ipv6_ra_sysctl
   systemctl daemon-reload || true
   systemctl enable systemd-networkd dnsmasq nftables >/dev/null 2>&1 || true
   systemctl disable systemd-networkd-wait-online.service >/dev/null 2>&1 || true
@@ -1181,9 +1293,10 @@ enable_lte4g(){
   else
     WAN_CONFIG="$(echo "$WAN_CONFIG" | awk -F'|' -v m="$LTE4G_METRIC" 'BEGIN{OFS="|"} $1=="lte4g"{$2="dhcp";$3=m} {print}')"
   fi
+  guide_networkd_iface_conflicts lte4g
   write_all_configs
-  info "lte4g 会通过 DHCP 获取地址，但 networkd 不把它加入主默认路由。"
-  info "脚本会启用策略路由：从 LTE 地址进入 R2 的 SSH，回复包仍从 lte4g 返回。"
+  info "lte4g 会通过 DHCPv4 + IPv6 RA 获取双栈地址；IPv4 不加入主默认路由。"
+  info "脚本会启用 IPv4/IPv6 策略路由：从 LTE 地址进入 R2 的 SSH，回复包仍从 lte4g 返回。"
   confirm "是否立即重新加载服务？" y && reload_services
   pause
 }
