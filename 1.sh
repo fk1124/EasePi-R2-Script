@@ -537,6 +537,7 @@ list_m2_candidates() {
     lsblk -dpno NAME,TYPE,SIZE,FSTYPE,MOUNTPOINT,MODEL,TRAN 2>/dev/null | sed 's/^/  /'
     echo
     echo "提示：M.2 NVMe 通常类似 /dev/nvme0n1；SATA SSD 可能类似 /dev/sda。"
+    echo "说明：/lxc 是目录挂载点，推荐把整块 SSD 重建为 1 个 ext4 分区，再挂载到 /lxc。"
 }
 
 partition_of_disk() {
@@ -548,9 +549,81 @@ partition_of_disk() {
     fi
 }
 
+partition_example_of_disk() {
+    partition_of_disk "$1"
+}
+
+disk_partitions() {
+    local disk="$1"
+    lsblk -lnp -o NAME,TYPE "$disk" 2>/dev/null | awk '$2=="part"{print $1}'
+}
+
+ensure_disk_tools() {
+    local missing=()
+    local cmd
+    for cmd in lsblk findmnt blkid mount umount wipefs parted partprobe mkfs.ext4 rsync; do
+        command_exists "$cmd" || missing+=("$cmd")
+    done
+    if [ "${#missing[@]}" -eq 0 ]; then
+        return 0
+    fi
+
+    warn "磁盘工具不完整，缺少：${missing[*]}"
+    if confirm "是否自动安装 parted / e2fsprogs / util-linux / rsync？" y; then
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y parted e2fsprogs util-linux rsync
+    else
+        die "缺少磁盘工具，无法继续。"
+    fi
+}
+
+unmount_disk_partitions() {
+    local disk="$1"
+    local part mp
+    while read -r part; do
+        [ -n "$part" ] || continue
+        if swapon --noheadings --show=NAME 2>/dev/null | grep -qx "$part"; then
+            warn "关闭 swap：$part"
+            swapoff "$part" || die "无法关闭 swap：$part"
+        fi
+
+        findmnt -rn -S "$part" -o TARGET 2>/dev/null | sort -r | while read -r mp; do
+            [ -n "$mp" ] || continue
+            warn "卸载：$part -> $mp"
+            umount "$mp" || die "无法卸载 $mp，请先手动停止正在占用它的服务。"
+        done
+    done < <(disk_partitions "$disk")
+}
+
+format_disk_as_lxc_ext4() {
+    local disk="$1"
+    local ack part
+
+    echo >&2
+    warn "你选择的是整块磁盘：$disk"
+    warn "下面操作会卸载该磁盘的所有分区，并清空整块磁盘上的所有数据。"
+    echo "当前分区情况：" >&2
+    lsblk -lnp -o NAME,TYPE,SIZE,FSTYPE,MOUNTPOINT "$disk" 2>/dev/null | sed 's/^/  /' >&2
+    echo >&2
+    read -r -p "如确认把整块磁盘重建为 /lxc 专用盘，请输入：FORMAT ${disk} : " ack || ack=""
+    [ "$ack" = "FORMAT ${disk}" ] || die "确认文本不匹配，已取消格式化。"
+
+    unmount_disk_partitions "$disk"
+    wipefs -a "$disk"
+    parted -s "$disk" mklabel gpt
+    parted -s "$disk" mkpart primary ext4 1MiB 100%
+    partprobe "$disk" || true
+    command_exists udevadm && udevadm settle || true
+    sleep 2
+    part="$(partition_of_disk "$disk")"
+    [ -b "$part" ] || die "创建分区后未找到 $part。"
+    mkfs.ext4 -F -L EasePiR2_LXC "$part"
+    echo "$part"
+}
+
 prepare_ext4_target() {
     local dev="$1"
-    local type fstype children ack part
+    local type fstype children ack part choice example pk
     type="$(lsblk -dn -o TYPE "$dev" 2>/dev/null | head -n1 || true)"
     fstype="$(lsblk -dn -o FSTYPE "$dev" 2>/dev/null | head -n1 || true)"
 
@@ -558,21 +631,37 @@ prepare_ext4_target() {
         disk)
             children="$(lsblk -nr "$dev" 2>/dev/null | awk 'NR>1 {print $1}' | head -n1 || true)"
             if [ -n "$children" ]; then
-                warn "$dev 已有分区，请直接选择要挂载的分区，例如 ${dev}p1 或 ${dev}1。"
-                return 1
+                example="$(partition_example_of_disk "$dev")"
+                echo >&2
+                warn "$dev 已有分区。你可以选择已有分区挂载到 $LXC_BASE，也可以清空整块磁盘后重建。"
+                echo "当前分区：" >&2
+                lsblk -lnp -o NAME,TYPE,SIZE,FSTYPE,MOUNTPOINT "$dev" 2>/dev/null | sed 's/^/  /' >&2
+                echo >&2
+                echo "1. 选择已有分区，例如 $example" >&2
+                echo "2. 卸载该磁盘所有分区，清空并重新格式化为 /lxc 专用 ext4 分区" >&2
+                echo "0. 取消" >&2
+                read -r -p "请选择: " choice || choice=""
+                case "$choice" in
+                    1)
+                        read -r -p "请输入要挂载到 ${LXC_BASE} 的分区路径，例如 ${example}: " part || part=""
+                        [ -b "$part" ] || die "分区不存在：$part"
+                        pk="$(lsblk -no PKNAME "$part" 2>/dev/null | head -n1 || true)"
+                        [ -n "$pk" ] && [ "/dev/$pk" = "$dev" ] || die "$part 不属于 $dev。"
+                        prepare_ext4_target "$part"
+                        ;;
+                    2)
+                        format_disk_as_lxc_ext4 "$dev"
+                        ;;
+                    0|"")
+                        die "已取消。"
+                        ;;
+                    *)
+                        die "无效选择。"
+                        ;;
+                esac
+                return 0
             fi
-            warn "将清空整块磁盘 $dev，创建 GPT + 单个 ext4 分区。"
-            read -r -p "如确认格式化，请输入：FORMAT ${dev} : " ack || ack=""
-            [ "$ack" = "FORMAT ${dev}" ] || die "确认文本不匹配，已取消格式化。"
-            wipefs -a "$dev"
-            parted -s "$dev" mklabel gpt
-            parted -s "$dev" mkpart primary ext4 1MiB 100%
-            partprobe "$dev" || true
-            sleep 2
-            part="$(partition_of_disk "$dev")"
-            [ -b "$part" ] || die "创建分区后未找到 $part。"
-            mkfs.ext4 -F -L EasePiR2_LXC "$part"
-            echo "$part"
+            format_disk_as_lxc_ext4 "$dev"
             ;;
         part)
             if [ -z "$fstype" ]; then
@@ -593,7 +682,8 @@ prepare_ext4_target() {
 }
 
 mount_lxc_to_ssd() {
-    local dev rootdisk pk target uuid tmp
+    local dev rootdisk pk target uuid tmp mp
+    ensure_disk_tools
     list_m2_candidates
     read -r -p "请输入要挂载到 ${LXC_BASE} 的磁盘或分区路径: " dev || dev=""
     [ -b "$dev" ] || die "设备不存在：$dev"
@@ -608,6 +698,21 @@ mount_lxc_to_ssd() {
     [ -b "$target" ] || die "目标设备不可用：$target"
 
     mkdir -p "$LXC_BASE"
+    if findmnt -rn -S "$target" >/dev/null 2>&1; then
+        while read -r mp; do
+            [ -n "$mp" ] || continue
+            if [ "$mp" = "$LXC_BASE" ]; then
+                ok "$target 已经挂载到 $LXC_BASE。"
+                ensure_dirs
+                findmnt "$LXC_BASE" || true
+                return 0
+            fi
+            warn "$target 当前已挂载到 $mp。"
+            confirm "是否卸载 $mp 并改挂到 $LXC_BASE？" y || die "已取消。"
+            umount "$mp" || die "无法卸载 $mp，请先手动停止占用它的服务。"
+        done < <(findmnt -rn -S "$target" -o TARGET 2>/dev/null | sort -r)
+    fi
+
     if findmnt -rn "$LXC_BASE" >/dev/null 2>&1; then
         warn "$LXC_BASE 已经是挂载点。"
         findmnt "$LXC_BASE" || true
