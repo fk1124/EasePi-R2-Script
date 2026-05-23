@@ -23,6 +23,10 @@ LTE_POLICY_TIMER="/etc/systemd/system/easepi-r2-lte4g-policy-route.timer"
 LTE_MANAGER_SCRIPT="/usr/local/sbin/easepi-r2-lte4g-manager.sh"
 LTE_MANAGER_SERVICE="/etc/systemd/system/easepi-r2-lte4g-manager.service"
 LTE_MANAGER_TIMER="/etc/systemd/system/easepi-r2-lte4g-manager.timer"
+IPV6_DDNS_CONF="$BASE_DIR/ipv6-ddns.env"
+IPV6_DDNS_SCRIPT="/usr/local/sbin/easepi-r2-ipv6-ddns.sh"
+IPV6_DDNS_SERVICE="/etc/systemd/system/easepi-r2-ipv6-ddns.service"
+IPV6_DDNS_TIMER="/etc/systemd/system/easepi-r2-ipv6-ddns.timer"
 LTE_POLICY_TABLE="${LTE_POLICY_TABLE:-1004}"
 LTE_POLICY_PRIO="${LTE_POLICY_PRIO:-1004}"
 
@@ -655,6 +659,10 @@ backup_now(){
   cp -a "$LTE_MANAGER_SCRIPT" "$target/lte4g-manager.sh" 2>/dev/null || true
   cp -a "$LTE_MANAGER_SERVICE" "$target/lte4g-manager.service" 2>/dev/null || true
   cp -a "$LTE_MANAGER_TIMER" "$target/lte4g-manager.timer" 2>/dev/null || true
+  cp -a "$IPV6_DDNS_CONF" "$target/ipv6-ddns.env" 2>/dev/null || true
+  cp -a "$IPV6_DDNS_SCRIPT" "$target/ipv6-ddns.sh" 2>/dev/null || true
+  cp -a "$IPV6_DDNS_SERVICE" "$target/ipv6-ddns.service" 2>/dev/null || true
+  cp -a "$IPV6_DDNS_TIMER" "$target/ipv6-ddns.timer" 2>/dev/null || true
   ls -1dt "$BACKUP_DIR"/* 2>/dev/null | tail -n +6 | xargs -r rm -rf
   echo "$target"
 }
@@ -691,6 +699,10 @@ restore_backup(){
   cp -a "$target/lte4g-manager.sh" "$LTE_MANAGER_SCRIPT" 2>/dev/null || true
   cp -a "$target/lte4g-manager.service" "$LTE_MANAGER_SERVICE" 2>/dev/null || true
   cp -a "$target/lte4g-manager.timer" "$LTE_MANAGER_TIMER" 2>/dev/null || true
+  cp -a "$target/ipv6-ddns.env" "$IPV6_DDNS_CONF" 2>/dev/null || true
+  cp -a "$target/ipv6-ddns.sh" "$IPV6_DDNS_SCRIPT" 2>/dev/null || true
+  cp -a "$target/ipv6-ddns.service" "$IPV6_DDNS_SERVICE" 2>/dev/null || true
+  cp -a "$target/ipv6-ddns.timer" "$IPV6_DDNS_TIMER" 2>/dev/null || true
   if [ -r "$target/easepi-r2-script/网络配置.env" ]; then
     mkdir -p "$BASE_DIR"
     cp -a "$target/easepi-r2-script/网络配置.env" "$CONFIG_FILE"
@@ -1374,6 +1386,439 @@ test_lte4g_connectivity(){
   return 1
 }
 
+guess_dns_zone(){
+  local fqdn="${1%.}"
+  awk -F. 'NF>=2 {print $(NF-1)"."$NF; exit} {print $0}' <<< "$fqdn"
+}
+
+ensure_ipv6_ddns_deps(){
+  local -a deps missing
+  local pkg
+  deps=(iproute2 curl ca-certificates jq openssl)
+  missing=()
+  echo "正在检测 IPv6 DDNS 依赖..."
+  for pkg in "${deps[@]}"; do
+    dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+  done
+  if [ "${#missing[@]}" -eq 0 ]; then
+    ok "IPv6 DDNS 必要依赖已安装。"
+    return 0
+  fi
+  warn "缺少以下依赖："
+  printf '  %s\n' "${missing[@]}"
+  confirm "是否立即安装缺少的 IPv6 DDNS 依赖？" y || return 1
+  install_packages "${missing[@]}"
+}
+
+write_ipv6_ddns_files(){
+  mkdir -p "$(dirname "$IPV6_DDNS_SCRIPT")" "$(dirname "$IPV6_DDNS_SERVICE")"
+  cat > "$IPV6_DDNS_SCRIPT" <<'EOF_IPV6_DDNS'
+#!/usr/bin/env bash
+set -uo pipefail
+
+CONF="/etc/easepi-r2-script/ipv6-ddns.env"
+LOG_TAG="easepi-r2-ipv6-ddns"
+
+log(){
+  logger -t "$LOG_TAG" "$*" 2>/dev/null || true
+  printf '%s\n' "$*"
+}
+
+fail(){
+  log "失败：$*"
+  exit 1
+}
+
+[ -r "$CONF" ] || fail "配置不存在：$CONF"
+# shellcheck disable=SC1090
+. "$CONF"
+
+: "${DDNS_IFACE:=lte4g}"
+: "${DDNS_RECORD_TYPE:=AAAA}"
+: "${DDNS_API_ENDPOINT:=}"
+
+need_cmd(){
+  command -v "$1" >/dev/null 2>&1 || fail "缺少命令：$1"
+}
+
+json_string(){
+  jq -Rn --arg v "$1" '$v'
+}
+
+urlencode(){
+  jq -nr --arg v "$1" '$v|@uri' | sed 's/%7E/~/g'
+}
+
+get_iface_ipv6(){
+  local ip
+  ip="$(ip -6 -o addr show dev "$DDNS_IFACE" scope global 2>/dev/null | awk '!/ temporary / && !/ deprecated / {split($4,a,"/"); print a[1]; exit}')"
+  [ -n "$ip" ] || ip="$(ip -6 -o addr show dev "$DDNS_IFACE" scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}')"
+  [ -n "$ip" ] || return 1
+  printf '%s\n' "$ip"
+}
+
+rr_from_domain(){
+  local fqdn="${DDNS_DOMAIN%.}" zone="${DDNS_ZONE%.}" rr
+  if [ "$fqdn" = "$zone" ]; then
+    printf '@\n'
+    return
+  fi
+  rr="${fqdn%.$zone}"
+  [ "$rr" != "$fqdn" ] && [ -n "$rr" ] || rr="@"
+  printf '%s\n' "$rr"
+}
+
+fqdn_dot(){
+  local fqdn="${DDNS_DOMAIN%.}"
+  printf '%s.\n' "$fqdn"
+}
+
+print_result_json(){
+  jq . 2>/dev/null || cat
+}
+
+update_cloudflare(){
+  local zone_id record_id body resp success
+  zone_id="${DDNS_TOKEN_ID:-}"
+  if [ -z "$zone_id" ]; then
+    resp="$(curl -sS -X GET "https://api.cloudflare.com/client/v4/zones?name=$DDNS_ZONE" \
+      -H "Authorization: Bearer $DDNS_TOKEN_KEY" \
+      -H "Content-Type: application/json")"
+    zone_id="$(printf '%s' "$resp" | jq -r '.result[0].id // empty')"
+  fi
+  [ -n "$zone_id" ] || fail "Cloudflare Zone ID 未找到。请确认 Token 具备 Zone Read 权限，或把 Token ID 填为 Zone ID。"
+
+  resp="$(curl -sS -X GET "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records?type=AAAA&name=$DDNS_DOMAIN" \
+    -H "Authorization: Bearer $DDNS_TOKEN_KEY" \
+    -H "Content-Type: application/json")"
+  record_id="$(printf '%s' "$resp" | jq -r '.result[0].id // empty')"
+  body="$(jq -n --arg name "$DDNS_DOMAIN" --arg content "$DDNS_IPV6" \
+    '{type:"AAAA",name:$name,content:$content,ttl:120,proxied:false}')"
+
+  if [ -n "$record_id" ]; then
+    resp="$(curl -sS -X PATCH "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records/$record_id" \
+      -H "Authorization: Bearer $DDNS_TOKEN_KEY" \
+      -H "Content-Type: application/json" \
+      --data "$body")"
+  else
+    resp="$(curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records" \
+      -H "Authorization: Bearer $DDNS_TOKEN_KEY" \
+      -H "Content-Type: application/json" \
+      --data "$body")"
+  fi
+  printf '%s\n' "$resp" | print_result_json
+  success="$(printf '%s' "$resp" | jq -r '.success // false')"
+  [ "$success" = true ] || fail "Cloudflare 解析提交失败。"
+}
+
+dnspod_post(){
+  local action="$1"
+  shift
+  curl -sS -X POST "https://dnsapi.cn/$action" \
+    --data-urlencode "login_token=$DDNS_TOKEN_ID,$DDNS_TOKEN_KEY" \
+    --data-urlencode "format=json" \
+    --data-urlencode "lang=cn" \
+    "$@"
+}
+
+update_dnspod(){
+  local rr record_id resp code
+  rr="$(rr_from_domain)"
+  resp="$(dnspod_post Record.List \
+    --data-urlencode "domain=$DDNS_ZONE" \
+    --data-urlencode "sub_domain=$rr" \
+    --data-urlencode "record_type=AAAA")"
+  record_id="$(printf '%s' "$resp" | jq -r '.records[0].id // empty')"
+
+  if [ -n "$record_id" ]; then
+    resp="$(dnspod_post Record.Modify \
+      --data-urlencode "domain=$DDNS_ZONE" \
+      --data-urlencode "record_id=$record_id" \
+      --data-urlencode "sub_domain=$rr" \
+      --data-urlencode "record_type=AAAA" \
+      --data-urlencode "record_line=默认" \
+      --data-urlencode "value=$DDNS_IPV6")"
+  else
+    resp="$(dnspod_post Record.Create \
+      --data-urlencode "domain=$DDNS_ZONE" \
+      --data-urlencode "sub_domain=$rr" \
+      --data-urlencode "record_type=AAAA" \
+      --data-urlencode "record_line=默认" \
+      --data-urlencode "value=$DDNS_IPV6")"
+  fi
+  printf '%s\n' "$resp" | print_result_json
+  code="$(printf '%s' "$resp" | jq -r '.status.code // empty')"
+  [ "$code" = 1 ] || fail "DNSPod 解析提交失败。"
+}
+
+update_simple_dyndns(){
+  local url="$1" resp
+  resp="$(curl -sS --get -u "$DDNS_TOKEN_ID:$DDNS_TOKEN_KEY" \
+    --data-urlencode "hostname=$DDNS_DOMAIN" \
+    --data-urlencode "myip=$DDNS_IPV6" \
+    "$url")"
+  printf '%s\n' "$resp"
+  case "$resp" in
+    good*|nochg*|*'good '*|*'nochg '*) return 0 ;;
+    *) fail "动态域名接口返回失败：$resp" ;;
+  esac
+}
+
+aliyun_rpc(){
+  local action="$1" tmp canonical first line key value string_to_sign signature url resp
+  shift
+  tmp="$(mktemp)"
+  {
+    printf 'Action=%s\n' "$action"
+    printf 'Version=2015-01-09\n'
+    printf 'Format=JSON\n'
+    printf 'AccessKeyId=%s\n' "$DDNS_TOKEN_ID"
+    printf 'SignatureMethod=HMAC-SHA1\n'
+    printf 'SignatureVersion=1.0\n'
+    printf 'SignatureNonce=%s-%s\n' "$(date +%s%N)" "$$"
+    printf 'Timestamp=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    for line in "$@"; do
+      printf '%s\n' "$line"
+    done
+  } > "$tmp"
+
+  canonical=""
+  first=1
+  while IFS='=' read -r key value; do
+    [ -n "$key" ] || continue
+    if [ "$first" -eq 1 ]; then
+      first=0
+    else
+      canonical="${canonical}&"
+    fi
+    canonical="${canonical}$(urlencode "$key")=$(urlencode "$value")"
+  done < <(sort "$tmp")
+  rm -f "$tmp"
+
+  string_to_sign="GET&%2F&$(urlencode "$canonical")"
+  signature="$(printf '%s' "$string_to_sign" | openssl dgst -sha1 -hmac "${DDNS_TOKEN_KEY}&" -binary | openssl base64 | tr -d '\n')"
+  url="https://alidns.aliyuncs.com/?Signature=$(urlencode "$signature")&$canonical"
+  resp="$(curl -sS "$url")"
+  printf '%s\n' "$resp"
+}
+
+update_aliyun(){
+  local rr resp record_id
+  rr="$(rr_from_domain)"
+  resp="$(aliyun_rpc DescribeDomainRecords "DomainName=$DDNS_ZONE" "RRKeyWord=$rr" "TypeKeyWord=AAAA")"
+  record_id="$(printf '%s' "$resp" | jq -r --arg rr "$rr" '.DomainRecords.Record[]? | select(.RR==$rr and .Type=="AAAA") | .RecordId' | head -n1)"
+
+  if [ -n "$record_id" ]; then
+    resp="$(aliyun_rpc UpdateDomainRecord "RecordId=$record_id" "RR=$rr" "Type=AAAA" "Value=$DDNS_IPV6")"
+  else
+    resp="$(aliyun_rpc AddDomainRecord "DomainName=$DDNS_ZONE" "RR=$rr" "Type=AAAA" "Value=$DDNS_IPV6")"
+  fi
+  printf '%s\n' "$resp" | print_result_json
+  printf '%s' "$resp" | jq -e '.RecordId' >/dev/null 2>&1 || fail "阿里云解析提交失败。"
+}
+
+update_huaweicloud(){
+  local endpoint zone_id name resp record_id body
+  endpoint="${DDNS_API_ENDPOINT:-https://dns.myhuaweicloud.com}"
+  zone_id="${DDNS_TOKEN_ID:-}"
+  name="$(fqdn_dot)"
+  if [ -z "$zone_id" ]; then
+    resp="$(curl -sS -X GET "$endpoint/v2/zones?name=${DDNS_ZONE}." \
+      -H "X-Auth-Token: $DDNS_TOKEN_KEY" \
+      -H "Content-Type: application/json")"
+    zone_id="$(printf '%s' "$resp" | jq -r '.zones[0].id // empty')"
+  fi
+  [ -n "$zone_id" ] || fail "华为云 Zone ID 未找到。请把 Token ID 填为 Zone ID，Token Key 填为 IAM X-Auth-Token。"
+
+  resp="$(curl -sS -X GET "$endpoint/v2/zones/$zone_id/recordsets?name=$name&type=AAAA" \
+    -H "X-Auth-Token: $DDNS_TOKEN_KEY" \
+    -H "Content-Type: application/json")"
+  record_id="$(printf '%s' "$resp" | jq -r '.recordsets[0].id // empty')"
+  body="$(jq -n --arg name "$name" --arg ip "$DDNS_IPV6" \
+    '{name:$name,type:"AAAA",records:[$ip],ttl:300}')"
+  if [ -n "$record_id" ]; then
+    resp="$(curl -sS -X PUT "$endpoint/v2/zones/$zone_id/recordsets/$record_id" \
+      -H "X-Auth-Token: $DDNS_TOKEN_KEY" \
+      -H "Content-Type: application/json" \
+      --data "$body")"
+  else
+    resp="$(curl -sS -X POST "$endpoint/v2/zones/$zone_id/recordsets" \
+      -H "X-Auth-Token: $DDNS_TOKEN_KEY" \
+      -H "Content-Type: application/json" \
+      --data "$body")"
+  fi
+  printf '%s\n' "$resp" | print_result_json
+  printf '%s' "$resp" | jq -e '.id' >/dev/null 2>&1 || fail "华为云解析提交失败。"
+}
+
+main(){
+  need_cmd ip
+  need_cmd curl
+  need_cmd jq
+  need_cmd openssl
+
+  [ "${DDNS_RECORD_TYPE^^}" = "AAAA" ] || fail "当前脚本只更新 AAAA 记录。"
+  DDNS_IPV6="$(get_iface_ipv6)" || fail "未从 $DDNS_IFACE 获取到公网 IPv6。"
+
+  log "准备更新：$DDNS_DOMAIN AAAA -> $DDNS_IPV6（接口：$DDNS_IFACE）"
+  case "${DDNS_PROVIDER,,}" in
+    cloudflare) update_cloudflare ;;
+    dnspod) update_dnspod ;;
+    aliyun) update_aliyun ;;
+    huaweicloud) update_huaweicloud ;;
+    3322) update_simple_dyndns "http://members.3322.net/dyndns/update" ;;
+    oray) update_simple_dyndns "https://ddns.oray.com/ph/update" ;;
+    *) fail "不支持的服务商：$DDNS_PROVIDER" ;;
+  esac
+  log "成功：$DDNS_DOMAIN AAAA 已提交为 $DDNS_IPV6"
+}
+
+main "$@"
+EOF_IPV6_DDNS
+  chmod 755 "$IPV6_DDNS_SCRIPT"
+
+  cat > "$IPV6_DDNS_SERVICE" <<EOF_IPV6_DDNS_SERVICE
+[Unit]
+Description=EasePi-R2 IPv6 DDNS updater
+After=network-online.target easepi-r2-lte4g-manager.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$IPV6_DDNS_SCRIPT
+TimeoutStartSec=90
+EOF_IPV6_DDNS_SERVICE
+
+  cat > "$IPV6_DDNS_TIMER" <<'EOF_IPV6_DDNS_TIMER'
+[Unit]
+Description=Refresh EasePi-R2 IPv6 DDNS
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=10min
+AccuracySec=30s
+Unit=easepi-r2-ipv6-ddns.service
+
+[Install]
+WantedBy=timers.target
+EOF_IPV6_DDNS_TIMER
+}
+
+configure_ipv6_ddns(){
+  need_root
+  load_config
+  ensure_ipv6_ddns_deps || { warn "IPv6 DDNS 依赖未安装，已取消。"; pause; return; }
+  write_ipv6_ddns_files
+
+  local provider_choice provider domain zone zone_default token_id token_key endpoint_note endpoint
+  echo "请选择 IPv6 DDNS 服务商："
+  echo "1. 3322 / 公云"
+  echo "2. Oray / 花生壳"
+  echo "3. DNSPod"
+  echo "4. 阿里云 Aliyun DNS"
+  echo "5. 华为云 HuaweiCloud DNS"
+  echo "6. Cloudflare"
+  read -r -p "请选择 [6]: " provider_choice
+  case "${provider_choice:-6}" in
+    1) provider=3322 ;;
+    2) provider=oray ;;
+    3) provider=dnspod ;;
+    4) provider=aliyun ;;
+    5) provider=huaweicloud ;;
+    6) provider=cloudflare ;;
+    *) warn "无效选择，默认使用 Cloudflare。"; provider=cloudflare ;;
+  esac
+
+  read -r -p "请输入完整域名，例如 home.example.com: " domain
+  domain="$(trim "$domain")"
+  [ -n "$domain" ] || { err "域名不能为空。"; pause; return; }
+  zone_default="$(guess_dns_zone "$domain")"
+  zone="$(read_default "主域名 / Zone" "$zone_default")"
+  zone="$(trim "$zone")"
+
+  case "$provider" in
+    cloudflare)
+      echo "Cloudflare：Token ID 可留空自动查 Zone；如果 Token 权限较窄，也可直接填写 Zone ID。"
+      read -r -p "Token ID / Zone ID（可留空）: " token_id
+      read -r -s -p "Token Key / API Token: " token_key
+      echo
+      ;;
+    dnspod)
+      echo "DNSPod：Token ID 填 DNSPod Token ID，Token Key 填 DNSPod Token。"
+      read -r -p "Token ID: " token_id
+      read -r -s -p "Token Key: " token_key
+      echo
+      ;;
+    aliyun)
+      echo "阿里云：Token ID 填 AccessKey ID，Token Key 填 AccessKey Secret。"
+      read -r -p "Token ID / AccessKey ID: " token_id
+      read -r -s -p "Token Key / AccessKey Secret: " token_key
+      echo
+      ;;
+    huaweicloud)
+      echo "华为云：Token ID 建议填写 DNS Zone ID；Token Key 填 IAM X-Auth-Token。"
+      read -r -p "Token ID / Zone ID（可留空自动查）: " token_id
+      read -r -s -p "Token Key / IAM X-Auth-Token: " token_key
+      echo
+      endpoint_note="https://dns.myhuaweicloud.com"
+      endpoint="$(read_default "华为云 DNS API Endpoint" "$endpoint_note")"
+      ;;
+    3322|oray)
+      echo "$provider：Token ID 填账号/用户名，Token Key 填密码或授权码。"
+      read -r -p "Token ID / 用户名: " token_id
+      read -r -s -p "Token Key / 密码或授权码: " token_key
+      echo
+      ;;
+  esac
+  token_id="$(trim "$token_id")"
+  token_key="$(trim "$token_key")"
+  [ -n "$token_key" ] || { err "Token Key 不能为空。"; pause; return; }
+
+  mkdir -p "$BASE_DIR"
+  cat > "$IPV6_DDNS_CONF" <<EOF_DDNS_CONF
+DDNS_PROVIDER='$(quote_sq "$provider")'
+DDNS_DOMAIN='$(quote_sq "$domain")'
+DDNS_ZONE='$(quote_sq "$zone")'
+DDNS_TOKEN_ID='$(quote_sq "$token_id")'
+DDNS_TOKEN_KEY='$(quote_sq "$token_key")'
+DDNS_IFACE='lte4g'
+DDNS_RECORD_TYPE='AAAA'
+DDNS_API_ENDPOINT='$(quote_sq "${endpoint:-}")'
+EOF_DDNS_CONF
+  chmod 600 "$IPV6_DDNS_CONF"
+
+  systemctl daemon-reload || true
+  systemctl enable --now easepi-r2-ipv6-ddns.timer >/dev/null 2>&1 || true
+  echo
+  info "正在提交 AAAA 解析，默认使用 lte4g 当前 IPv6..."
+  if "$IPV6_DDNS_SCRIPT"; then
+    ok "IPv6 DDNS 提交成功，定时刷新服务已启用。"
+  else
+    err "IPv6 DDNS 提交失败，请检查上方接口返回和 Token 权限。"
+  fi
+  pause
+}
+
+lte4g_ddns_menu(){
+  while true; do
+    clear 2>/dev/null || true
+    echo "============================================================"
+    echo " 4G网络管理 / IPV6 DDNS"
+    echo "============================================================"
+    echo "1. 4G网络管理"
+    echo "2. IPV6 DDNS"
+    echo "0. 返回"
+    echo "============================================================"
+    read -r -p "请选择：" choice
+    case "$choice" in
+      1) enable_lte4g ;;
+      2) configure_ipv6_ddns ;;
+      0) return ;;
+      *) warn "无效选择"; sleep 1 ;;
+    esac
+  done
+}
+
 show_network(){
   load_config
   clear 2>/dev/null || true
@@ -1405,7 +1850,7 @@ show_network(){
   echo "------------------------------------------------------------"
   echo "服务："
   local svc unit
-  for svc in systemd-networkd dnsmasq nftables ssh sshd hostapd "wpa_supplicant@$WLAN_IFACE" easepi-r2-lte4g-manager.timer easepi-r2-lte4g-policy-route.timer; do
+  for svc in systemd-networkd dnsmasq nftables ssh sshd hostapd "wpa_supplicant@$WLAN_IFACE" easepi-r2-lte4g-manager.timer easepi-r2-lte4g-policy-route.timer easepi-r2-ipv6-ddns.timer; do
     case "$svc" in
       *.service|*.timer) unit="$svc" ;;
       *) unit="$svc.service" ;;
@@ -1736,7 +2181,7 @@ install_all_deps(){
   deps=(
     iproute2 ethtool bridge-utils dnsmasq nftables
     openssh-server curl ca-certificates systemd-resolved
-    iw wireless-regdb wpasupplicant hostapd rfkill
+    iw wireless-regdb wpasupplicant hostapd rfkill jq openssl
     kmod usbutils modemmanager usb-modeswitch
   )
   missing=()
@@ -1993,7 +2438,7 @@ main_menu(){
     echo "3. 一键开启SSH-ROOT用户登录"
     echo "4. 一键查看当前网络配置"
     echo "5. 本地网络路由管理"
-    echo "6. 4G网络管理"
+    echo "6. 4G网络管理 / IPV6 DDNS"
     echo "7. 无线网络管理"
     echo "8. 重新加载 networkd / dnsmasq / nftables"
     echo "9. 一键扩容 rootfs"
@@ -2007,7 +2452,7 @@ main_menu(){
       3) configure_ssh_root ;;
       4) show_network ;;
       5) local_network_router_menu ;;
-      6) enable_lte4g ;;
+      6) lte4g_ddns_menu ;;
       7) wifi_menu ;;
       8) backup_now 重载 >/dev/null; reload_services; pause ;;
       9) expand_rootfs ;;
