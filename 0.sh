@@ -219,6 +219,33 @@ install_packages(){
     "${missing[@]}"
 }
 
+ensure_lte4g_deps(){
+  local -a deps missing
+  local pkg mod
+  deps=(iproute2 iputils-ping kmod usbutils modemmanager usb-modeswitch ppp)
+  missing=()
+  for pkg in "${deps[@]}"; do
+    dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    warn "4G管理缺少运行依赖：${missing[*]}"
+    install_packages "${missing[@]}" || {
+      err "4G管理依赖安装失败；slim 镜像请先确认 eth0 可联网或手动安装上述软件包。"
+      return 1
+    }
+  fi
+
+  systemctl disable --now ModemManager.service >/dev/null 2>&1 || true
+  for mod in rndis_host cdc_ether cdc_acm usbserial usb_wwan option; do
+    modprobe "$mod" 2>/dev/null || true
+  done
+  if has_cmd udevadm; then
+    udevadm control --reload-rules >/dev/null 2>&1 || true
+    udevadm trigger --subsystem-match=usb --action=add >/dev/null 2>&1 || true
+    udevadm settle --timeout=15 >/dev/null 2>&1 || true
+  fi
+}
+
 detect_system(){
   OS_ID=""
   OS_ID_LIKE=""
@@ -1123,6 +1150,9 @@ ml307r_present(){
 }
 
 bind_ml307r_at(){
+  modprobe rndis_host 2>/dev/null || true
+  modprobe cdc_ether 2>/dev/null || true
+  modprobe cdc_acm 2>/dev/null || true
   modprobe usbserial 2>/dev/null || true
   modprobe usb_wwan 2>/dev/null || true
   modprobe option 2>/dev/null || true
@@ -2197,6 +2227,7 @@ local_network_router_menu(){
 enable_lte4g(){
   need_root
   load_config
+  ensure_lte4g_deps || { pause; return; }
   LTE4G_METRIC="$(read_default "lte4g 备用 WAN 默认路由 metric，建议高于 eth0" "$LTE4G_METRIC")"
   if ! echo "$WAN_CONFIG" | awk -F'|' '$1=="lte4g"{found=1} END{exit !found}'; then
     WAN_CONFIG="${WAN_CONFIG:+$WAN_CONFIG
