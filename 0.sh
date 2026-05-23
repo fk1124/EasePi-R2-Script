@@ -23,6 +23,7 @@ LTE_POLICY_TIMER="/etc/systemd/system/easepi-r2-lte4g-policy-route.timer"
 LTE_MANAGER_SCRIPT="/usr/local/sbin/easepi-r2-lte4g-manager.sh"
 LTE_MANAGER_SERVICE="/etc/systemd/system/easepi-r2-lte4g-manager.service"
 LTE_MANAGER_TIMER="/etc/systemd/system/easepi-r2-lte4g-manager.timer"
+LTE_NETWORK_CONF="$NETWORK_DIR/45-r2-wan-lte4g.network"
 IPV6_DDNS_CONF="$BASE_DIR/ipv6-ddns.env"
 IPV6_DDNS_SCRIPT="/usr/local/sbin/easepi-r2-ipv6-ddns.sh"
 IPV6_DDNS_SERVICE="/etc/systemd/system/easepi-r2-ipv6-ddns.service"
@@ -152,6 +153,7 @@ init_defaults(){
   LAN_DNS="${LAN_DNS:-$LAN_IP}"
   NAT_OUT="${NAT_OUT:-eth0}"
   LTE4G_METRIC="${LTE4G_METRIC:-30000}"
+  ROUTER_MODE="${ROUTER_MODE:-no}"
   WLAN_IFACE="${WLAN_IFACE:-wlan0}"
   WLAN_METRIC="${WLAN_METRIC:-800}"
   WLAN_MODE="${WLAN_MODE:-未配置}"
@@ -181,10 +183,15 @@ UPSTREAM_DNS='$(quote_sq "$UPSTREAM_DNS")'
 LAN_DNS='$(quote_sq "$LAN_DNS")'
 NAT_OUT='$(quote_sq "$NAT_OUT")'
 LTE4G_METRIC='$(quote_sq "$LTE4G_METRIC")'
+ROUTER_MODE='$(quote_sq "$ROUTER_MODE")'
 WLAN_IFACE='$(quote_sq "$WLAN_IFACE")'
 WLAN_METRIC='$(quote_sq "$WLAN_METRIC")'
 WLAN_MODE='$(quote_sq "$WLAN_MODE")'
 EOF_CONF
+}
+
+enable_router_mode(){
+  ROUTER_MODE=yes
 }
 
 install_packages(){
@@ -718,6 +725,33 @@ clean_networkd_files(){
   rm -f "$NETWORK_DIR"/3[0-9]-r2-*.network "$NETWORK_DIR"/4[0-9]-r2-*.network
 }
 
+clean_lte4g_networkd_files(){
+  mkdir -p "$NETWORK_DIR"
+  rm -f "$NETWORK_DIR"/*-r2-wan-lte4g.network
+}
+
+cleanup_standalone_lte4g_router_artifacts(){
+  local had_dnsmasq=0 had_nft=0
+  [ -e "$DNSMASQ_CONF" ] && had_dnsmasq=1
+  [ -e "$NFT_CONF" ] && had_nft=1
+  clean_lte4g_networkd_files
+  rm -f "$NETWORK_DIR"/20-r2-br-lan.netdev "$NETWORK_DIR"/21-r2-br-lan.network
+  rm -f "$NETWORK_DIR"/3[0-9]-r2-lan-*.network "$NETWORK_DIR"/4[0-9]-r2-wan-*.network
+  rm -f "$DNSMASQ_CONF" "$NFT_CONF" "$SYSCTL_CONF"
+  if [ "$had_nft" -eq 1 ]; then
+    nft delete table ip "$NFT_TABLE" 2>/dev/null || true
+    systemctl disable --now nftables.service >/dev/null 2>&1 || true
+  fi
+  if [ "$had_dnsmasq" -eq 1 ]; then
+    systemctl disable --now dnsmasq.service >/dev/null 2>&1 || true
+  fi
+  if ip link show br-lan >/dev/null 2>&1; then
+    ip addr flush dev br-lan 2>/dev/null || true
+    ip link set br-lan down 2>/dev/null || true
+    ip link delete br-lan type bridge 2>/dev/null || ip link delete br-lan 2>/dev/null || true
+  fi
+}
+
 networkd_file_matches_iface(){
   local file="$1" iface="$2" line value pattern in_match=0
   [ -r "$file" ] || return 1
@@ -896,6 +930,45 @@ EOF_LTE_RA
     fi
     idx=$((idx+1))
   done <<< "$WAN_CONFIG"
+}
+
+write_lte4g_networkd(){
+  local metric="$LTE4G_METRIC" dns_list="$DEVICE_DNS"
+  local ifname mode row_metric addr gateway row_dns
+  clean_lte4g_networkd_files
+  while IFS='|' read -r ifname mode row_metric addr gateway row_dns; do
+    [ "$ifname" = lte4g ] || continue
+    [ "${mode:-dhcp}" = disabled ] && return 0
+    metric="${row_metric:-$metric}"
+    dns_list="${row_dns:-$dns_list}"
+    break
+  done <<< "$WAN_CONFIG"
+  cat > "$LTE_NETWORK_CONF" <<EOF_LTE_WAN
+[Match]
+Name=lte4g
+
+[Link]
+RequiredForOnline=no
+
+[Network]
+DHCP=yes
+IPv6AcceptRA=yes
+LinkLocalAddressing=ipv6
+$(for d in $dns_list; do echo "DNS=$d"; done)
+
+[DHCPv4]
+UseDNS=no
+UseRoutes=no
+RouteMetric=$metric
+
+[IPv6AcceptRA]
+UseDNS=no
+RouteMetric=$metric
+
+[DHCPv6]
+UseDNS=no
+WithoutRA=solicit
+EOF_LTE_WAN
 }
 
 write_dnsmasq(){
@@ -1320,6 +1393,13 @@ write_all_configs(){
   write_lte4g_policy_files
 }
 
+write_lte4g_configs(){
+  save_config
+  write_lte4g_networkd
+  write_lte4g_manager_files
+  write_lte4g_policy_files
+}
+
 reload_services(){
   need_root
   local step=0 total=12
@@ -1372,9 +1452,55 @@ reload_services(){
   ok "networkd / dnsmasq / nftables 已重新加载。"
 }
 
+reload_lte4g_services(){
+  need_root
+  local step=0 total=9
+  reload_step(){
+    step=$((step+1))
+    info "[$step/$total] $*"
+  }
+
+  echo
+  info "Reloading standalone lte4g services without br-lan, dnsmasq, or NAT."
+
+  reload_step "读取当前配置..."
+  load_config
+
+  reload_step "清理脚本生成的 LAN/NAT 配置..."
+  cleanup_standalone_lte4g_router_artifacts
+
+  reload_step "写入 lte4g networkd / 管理服务 / 策略路由配置..."
+  write_lte4g_configs
+
+  reload_step "重新加载 systemd 服务配置..."
+  systemctl daemon-reload || true
+
+  reload_step "启用 systemd-networkd..."
+  systemctl enable --now systemd-networkd >/dev/null 2>&1 || true
+
+  reload_step "禁用 systemd-networkd-wait-online，避免无网口等待超时..."
+  systemctl disable systemd-networkd-wait-online.service >/dev/null 2>&1 || true
+  systemctl mask systemd-networkd-wait-online.service >/dev/null 2>&1 || true
+
+  reload_step "重新加载 networkd 配置..."
+  networkctl reload >/dev/null 2>&1 || systemctl reload systemd-networkd 2>/dev/null || true
+  networkctl reconfigure lte4g >/dev/null 2>&1 || true
+
+  reload_step "启动/刷新 lte4g 管理服务..."
+  sync_lte4g_manager_service
+  apply_lte4g_ipv6_ra_sysctl
+  networkctl reconfigure lte4g >/dev/null 2>&1 || true
+
+  reload_step "启动/刷新 lte4g 策略路由服务..."
+  sync_lte4g_policy_service
+
+  ok "lte4g 已按独立模式重新加载，未启用 br-lan/dnsmasq/nftables。"
+}
+
 test_lte4g_connectivity(){
   local iface="${1:-lte4g}" ipv4_target="${LTE4G_TEST_IPV4:-223.5.5.5}" ipv6_target="${LTE4G_TEST_IPV6:-2400:3200::1}"
   local tmp4 tmp6 v4_ok=1 v6_ok=1
+  local addr4 addr4_ip addr6 addr6_ip
 
   echo
   info "正在通过 $iface 测试外网 IPv4/IPv6 连通性..."
@@ -1391,20 +1517,33 @@ test_lte4g_connectivity(){
   sleep 2
 
   ip -br addr show "$iface" 2>/dev/null | sed 's/^/  /' || true
+  addr4="$(ip -o -4 addr show dev "$iface" scope global 2>/dev/null | awk '{print $4; exit}')"
+  addr4_ip="${addr4%/*}"
+  addr6="$(ip -o -6 addr show dev "$iface" scope global 2>/dev/null | awk '!/ temporary / {print $4; exit}')"
+  [ -n "$addr6" ] || addr6="$(ip -o -6 addr show dev "$iface" scope global 2>/dev/null | awk '{print $4; exit}')"
+  addr6_ip="${addr6%/*}"
 
   tmp4="$(mktemp)"
   tmp6="$(mktemp)"
   echo
-  info "IPv4 测试：ping -4 -I $iface -c 3 -W 3 $ipv4_target"
-  if ping -4 -I "$iface" -c 3 -W 3 "$ipv4_target" >"$tmp4" 2>&1; then
-    v4_ok=0
+  if [ -n "$addr4_ip" ]; then
+    info "IPv4 测试：ping -4 -I $addr4_ip -c 3 -W 3 $ipv4_target"
+    if ping -4 -I "$addr4_ip" -c 3 -W 3 "$ipv4_target" >"$tmp4" 2>&1; then
+      v4_ok=0
+    fi
+  else
+    printf '%s\n' "$iface 没有获取到全局 IPv4 地址。" >"$tmp4"
   fi
   sed 's/^/  /' "$tmp4"
 
   echo
-  info "IPv6 测试：ping -6 -I $iface -c 3 -W 3 $ipv6_target"
-  if ping -6 -I "$iface" -c 3 -W 3 "$ipv6_target" >"$tmp6" 2>&1; then
-    v6_ok=0
+  if [ -n "$addr6_ip" ]; then
+    info "IPv6 测试：ping -6 -I $addr6_ip -c 3 -W 3 $ipv6_target"
+    if ping -6 -I "$addr6_ip" -c 3 -W 3 "$ipv6_target" >"$tmp6" 2>&1; then
+      v6_ok=0
+    fi
+  else
+    printf '%s\n' "$iface 没有获取到全局 IPv6 地址。" >"$tmp6"
   fi
   sed 's/^/  /' "$tmp6"
   rm -f "$tmp4" "$tmp6"
@@ -1898,6 +2037,7 @@ show_network(){
 configure_wan(){
   need_root
   load_config
+  enable_router_mode
   local new_config="" count i ifname mode metric addr gateway dns_list mode_choice default_if
   echo "当前物理网卡："; physical_ifaces | sed 's/^/  /'
   echo
@@ -1937,6 +2077,7 @@ configure_wan(){
 configure_lan(){
   need_root
   load_config
+  enable_router_mode
   local p3
   echo "当前物理网卡："; physical_ifaces | sed 's/^/  /'
   LAN_CIDR="$(read_default "br-lan 地址/CIDR" "$LAN_CIDR")"
@@ -1958,6 +2099,7 @@ configure_lan(){
 configure_dhcp(){
   need_root
   load_config
+  enable_router_mode
   DHCP_START="$(read_default "DHCP 起始地址" "$DHCP_START")"
   DHCP_END="$(read_default "DHCP 结束地址" "$DHCP_END")"
   DHCP_MASK="$(read_default "DHCP 子网掩码" "$DHCP_MASK")"
@@ -1970,6 +2112,7 @@ configure_dhcp(){
 configure_dns(){
   need_root
   load_config
+  enable_router_mode
   DEVICE_DNS="$(read_default "设备本身 DNS，空格分隔" "$DEVICE_DNS")"
   UPSTREAM_DNS="$(read_default "dnsmasq 上游 DNS，空格分隔" "$UPSTREAM_DNS")"
   LAN_DNS="$(read_default "通过 DHCP 下发给 LAN 客户端的 DNS" "$LAN_DNS")"
@@ -1985,6 +2128,7 @@ configure_dns(){
 configure_nat(){
   need_root
   load_config
+  enable_router_mode
   echo "当前 WAN："
   echo "$WAN_CONFIG" | awk -F'|' '{printf "  %s  模式=%s  跃点=%s\n",$1,$2,$3}'
   NAT_OUT="$(read_default "NAT 出口，可填多个网卡，空格分隔" "$NAT_OUT")"
@@ -1997,6 +2141,7 @@ configure_nat(){
 configure_metric(){
   need_root
   load_config
+  enable_router_mode
   local new_config="" ifname mode metric addr gateway dns_list new_metric
   echo "当前 WAN 跃点："
   echo "$WAN_CONFIG" | awk -F'|' '{printf "  %s  metric=%s  模式=%s\n",$1,$3,$2}'
@@ -2052,13 +2197,21 @@ enable_lte4g(){
     WAN_CONFIG="$(echo "$WAN_CONFIG" | awk -F'|' -v m="$LTE4G_METRIC" 'BEGIN{OFS="|"} $1=="lte4g"{$2="dhcp";$3=m} {print}')"
   fi
   guide_networkd_iface_conflicts lte4g
-  write_all_configs
+  if [ "${ROUTER_MODE:-no}" = yes ]; then
+    write_all_configs
+  else
+    write_lte4g_configs
+  fi
   info "功能 10 会安装 lte4g manager：自动拨起 ML307R RNDIS，并刷新 IPv4/IPv6 管理入口路由。"
   info "lte4g 会通过 DHCPv4 + IPv6 RA 获取双栈地址；IPv4 不加入主默认路由。"
   info "脚本会启用 IPv4/IPv6 策略路由：从 LTE 地址进入 R2 的 SSH，回复包仍从 lte4g 返回。"
   info "提示：下面直接回车，或只输入空格再回车，都会按 Y 处理。"
   if confirm "是否立即重新加载服务？" y; then
-    reload_services
+    if [ "${ROUTER_MODE:-no}" = yes ]; then
+      reload_services
+    else
+      reload_lte4g_services
+    fi
     test_lte4g_connectivity lte4g || true
   else
     warn "已写入配置，但尚未重新加载服务；暂不进行 lte4g 外网检测。"
