@@ -1740,25 +1740,25 @@ configure_ipv6_ddns(){
     cloudflare)
       echo "Cloudflare：Token ID 可留空自动查 Zone；如果 Token 权限较窄，也可直接填写 Zone ID。"
       read -r -p "Token ID / Zone ID（可留空）: " token_id
-      read -r -s -p "Token Key / API Token: " token_key
+      read -r -p "Token Key / API Token（可直接粘贴，明文显示）: " token_key
       echo
       ;;
     dnspod)
       echo "DNSPod：Token ID 填 DNSPod Token ID，Token Key 填 DNSPod Token。"
       read -r -p "Token ID: " token_id
-      read -r -s -p "Token Key: " token_key
+      read -r -p "Token Key（可直接粘贴，明文显示）: " token_key
       echo
       ;;
     aliyun)
       echo "阿里云：Token ID 填 AccessKey ID，Token Key 填 AccessKey Secret。"
       read -r -p "Token ID / AccessKey ID: " token_id
-      read -r -s -p "Token Key / AccessKey Secret: " token_key
+      read -r -p "Token Key / AccessKey Secret（可直接粘贴，明文显示）: " token_key
       echo
       ;;
     huaweicloud)
       echo "华为云：Token ID 建议填写 DNS Zone ID；Token Key 填 IAM X-Auth-Token。"
       read -r -p "Token ID / Zone ID（可留空自动查）: " token_id
-      read -r -s -p "Token Key / IAM X-Auth-Token: " token_key
+      read -r -p "Token Key / IAM X-Auth-Token（可直接粘贴，明文显示）: " token_key
       echo
       endpoint_note="https://dns.myhuaweicloud.com"
       endpoint="$(read_default "华为云 DNS API Endpoint" "$endpoint_note")"
@@ -1766,13 +1766,14 @@ configure_ipv6_ddns(){
     3322|oray)
       echo "$provider：Token ID 填账号/用户名，Token Key 填密码或授权码。"
       read -r -p "Token ID / 用户名: " token_id
-      read -r -s -p "Token Key / 密码或授权码: " token_key
+      read -r -p "Token Key / 密码或授权码（可直接粘贴，明文显示）: " token_key
       echo
       ;;
   esac
   token_id="$(trim "$token_id")"
   token_key="$(trim "$token_key")"
   [ -n "$token_key" ] || { err "Token Key 不能为空。"; pause; return; }
+  info "Token Key 将保存到 $IPV6_DDNS_CONF，文件权限会设置为 600，仅 root 可读写。"
 
   mkdir -p "$BASE_DIR"
   cat > "$IPV6_DDNS_CONF" <<EOF_DDNS_CONF
