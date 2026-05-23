@@ -120,6 +120,26 @@ iface_exists() {
     ip link show "$1" >/dev/null 2>&1
 }
 
+cleanup_host_openwrt_lan_conflicts() {
+    local dev cidr
+
+    if [ "$HOST_BR" != "br-lan" ] && ip link show br-lan >/dev/null 2>&1; then
+        log "检测到宿主残留 br-lan，清理它，避免占用 OpenWrt 网关 ${OPENWRT_IP:-10.10.0.1}..."
+        ip addr flush dev br-lan 2>/dev/null || true
+        ip link set br-lan down 2>/dev/null || true
+        ip link delete br-lan type bridge 2>/dev/null || ip link delete br-lan 2>/dev/null || true
+    fi
+
+    [ -n "${OPENWRT_IP:-}" ] || return 0
+
+    while read -r dev cidr; do
+        [ -n "$dev" ] || continue
+        dev="${dev%%@*}"
+        log "清理宿主残留地址 ${cidr} on ${dev}，避免和 OpenWrt 网关冲突..."
+        ip addr del "$cidr" dev "$dev" 2>/dev/null || true
+    done < <(ip -o -4 addr show | awk -v target="$OPENWRT_IP" '{ split($4, a, "/"); if (a[1] == target) print $2, $4 }')
+}
+
 normalize_if_list() {
     local raw="$1"
     local out=""
@@ -794,14 +814,34 @@ disable_conflicting_host_network_stack() {
 
     if [ -d /etc/systemd/network ]; then
         mkdir -p /etc/easepi-r2-openwrt-lxc/disabled-networkd
-        for f in /etc/systemd/network/*easepi-r2*.network /etc/systemd/network/*easepi-r2*.netdev /etc/systemd/network/*easepi-r2*.link; do
+        for f in /etc/systemd/network/*easepi-r2*.network /etc/systemd/network/*easepi-r2*.netdev /etc/systemd/network/*easepi-r2*.link /etc/systemd/network/*r2-br-lan* /etc/systemd/network/*r2-lan-*; do
             [ -e "\$f" ] || continue
             mv "\$f" "/etc/easepi-r2-openwrt-lxc/disabled-networkd/\$(basename "\$f")" 2>/dev/null || true
         done
     fi
 }
 
+remove_stale_host_lan_conflicts() {
+    if [ "\$HOST_BR" != "br-lan" ] && ip link show br-lan >/dev/null 2>&1; then
+        log "removing stale host br-lan to avoid conflict with OpenWrt gateway \${OPENWRT_IP}..."
+        ip addr flush dev br-lan 2>/dev/null || true
+        ip link set br-lan down 2>/dev/null || true
+        ip link delete br-lan type bridge 2>/dev/null || ip link delete br-lan 2>/dev/null || true
+    fi
+
+    if [ -n "\$OPENWRT_IP" ]; then
+        ip -o -4 addr show | awk -v target="\$OPENWRT_IP" '{ split(\$4, a, "/"); if (a[1] == target) print \$2, \$4 }' | while read -r DEV CIDR; do
+            [ -n "\$DEV" ] || continue
+            DEV="\${DEV%%@*}"
+            log "removing stale host address \${CIDR} from \${DEV}..."
+            ip addr del "\$CIDR" dev "\$DEV" 2>/dev/null || true
+        done
+    fi
+}
+
 disable_conflicting_host_network_stack
+
+remove_stale_host_lan_conflicts
 
 log "loading kernel modules..."
 
@@ -915,6 +955,8 @@ systemctl daemon-reload
 systemctl enable owrt-lxc-hostnet.service
 systemctl enable lxc.service 2>/dev/null || true
 systemctl enable lxcfs.service 2>/dev/null || true
+
+cleanup_host_openwrt_lan_conflicts
 
 echo
 echo "========== 阶段 2：预创建宿主 ${HOST_BR}，不释放 eth 网卡 =========="
