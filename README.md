@@ -23,7 +23,7 @@ bash 9.sh
 | 脚本 | 状态 | 用途 |
 | --- | --- | --- |
 | `0.sh` | 可用 | EasePi-R2 Debian / Armbian 宿主网络管理 |
-| `1.sh` | 可用 | 创建并切换到 OpenWrt LXC 宿主网络方案 |
+| `1.sh` | 可用 | LXC 专属一键布置与容器管理 |
 | `2.sh` | 预留 | 待定义 |
 | `3.sh` | 预留 | 待定义 |
 | `4.sh` | 预留 | 待定义 |
@@ -100,27 +100,41 @@ bash 0.sh
 </details>
 
 <details>
-<summary><code>1.sh</code>：OpenWrt LXC 初始化和最终切网</summary>
+<summary><code>1.sh</code>：LXC 专属一键布置与容器管理</summary>
 
-### 适用场景
+### 脚本定位
 
-- 在 EasePi-R2 宿主上创建 OpenWrt 24.10.6 LXC。
-- 将选定物理网口交给 OpenWrt LXC，宿主通过 `br-hostlan` / `host0` 回接到 OpenWrt LAN。
-- 适合 EasePi-R2-LiteHost 作为轻量宿主，运行 OpenWrt LXC + Debian LXC + Redroid。
+`1.sh` 是 EasePi-R2-LiteHost 的 LXC 管理菜单，用来准备 LXC 宿主环境、管理 `/lxc` 目录、预下载 rootfs，并安装 OpenWrt / Debian / Ubuntu 容器。
 
-脚本整理自旧版设计：<https://gitee.com/fang-xiaomu/r2-openwrt-lxc/blob/master/lxc.openwrt.cn_source_fix.sh>
+### 菜单功能
+
+```text
+1. 一键检测并安装 LXC 所有依赖
+2. 一键检测并安装 OpenWrt 所需 Kmod
+3. LXC 目录管理
+4. rootfs 管理
+5. 一键安装 OpenWrt 24
+6. 一键安装 OpenWrt 25
+7. 一键安装 Debian 12 Bookworm
+8. 一键安装 Debian 13 Trixie
+9. 一键安装 Ubuntu 24.04 Noble
+10. LXC 备份 / 还原
+0. 退出
+```
 
 ### 默认规划
 
 ```text
-WAN：eth0
-LAN：eth1 eth2 eth3
+LXC 根目录：/lxc
+容器目录：/lxc/containers
+rootfs 缓存：/lxc/rootfs-cache
+备份目录：/lxc/backups
 OpenWrt LAN：10.10.0.1/24
 宿主 IP：10.10.0.2/24
-DHCP：10.10.0.100 - 10.10.0.249
-APT 源：清华 TUNA Debian 镜像
-OpenWrt rootfs：上海交通大学 SJTUG OpenWrt 镜像
+宿主回接桥：br-hostlan
 ```
+
+OpenWrt 容器会接管你选择的物理 WAN/LAN 网口；Debian / Ubuntu 容器会自动桥接到 `br-hostlan`，也就是接在 OpenWrt LAN 下面。
 
 ### 执行方式
 
@@ -129,49 +143,12 @@ cd /root
 bash 1.sh
 ```
 
-### 非交互示例
+### 注意
 
-```bash
-SKIP_WIZARD=1 SKIP_CONFIRM=1 \
-WAN_IF=eth0 \
-LAN_IFS="eth1 eth2 eth3" \
-LAN_CIDR=10.10.0.0/24 \
-OPENWRT_IP=10.10.0.1 \
-HOST_IP=10.10.0.2 \
-DHCP_START_IP=10.10.0.100 \
-DHCP_END_IP=10.10.0.249 \
-bash 1.sh
-```
-
-### 常用变量
-
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `CT_NAME` | `openwrt` | LXC 容器名称 |
-| `WAN_IF` | 交互选择，默认 `eth0` | OpenWrt WAN 物理口 |
-| `LAN_IFS` | 交互选择，默认 `eth1 eth2 eth3` | OpenWrt LAN 物理口 |
-| `HOST_BR` | `br-hostlan` | 宿主回接网桥 |
-| `ROOTFS_URL` | SJTUG OpenWrt 24.10.6 rootfs | OpenWrt rootfs 下载地址 |
-| `ENABLE_APT_CHINA_MIRROR` | `1` | 是否切换 Debian APT 国内源 |
-| `DISABLE_HOST_ROUTER_STACK` | `1` | cutover 时停用宿主侧 networkd/dnsmasq/nftables，避免抢网口 |
-
-### 执行后
-
-如果当前 SSH 经过被直通给 OpenWrt 的物理网口，最终 `CUTOVER` 阶段断开是正常现象。断开后把电脑网线接到 OpenWrt LAN 口，电脑设置 DHCP，然后访问：
-
-```text
-OpenWrt: http://10.10.0.1
-宿主 SSH: ssh root@10.10.0.2
-```
-
-排查日志：
-
-```bash
-cat /var/log/owrt-lxc-finalize.log
-lxc-info -n openwrt
-ip route
-cat /etc/resolv.conf
-```
+- SSD 挂载工具不会静默格式化磁盘，格式化前需要手工输入确认文本。
+- OpenWrt 24 / OpenWrt 25 可以都下载 rootfs，但同一时间只建议运行一个路由型 OpenWrt 容器。
+- 备份容器前必须先关机，脚本检测到容器运行中会拒绝备份。
+- OpenWrt 最终切网阶段可能断开当前 SSH，完成后访问 `http://10.10.0.1`。
 
 </details>
 
