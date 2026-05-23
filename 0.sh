@@ -52,7 +52,7 @@ read_default(){
 
 confirm(){
   local prompt="$1" def="${2:-y}" val hint
-  [ "$def" = y ] && hint="Y/n" || hint="y/N"
+  [ "$def" = y ] && hint="Y/n，回车或空格=Y" || hint="y/N，回车或空格=N"
   read -r -p "$prompt [$hint]: " val
   val="$(trim "$val")"
   val="${val:-$def}"
@@ -1322,20 +1322,53 @@ write_all_configs(){
 
 reload_services(){
   need_root
+  local step=0 total=12
+  reload_step(){
+    step=$((step+1))
+    info "[$step/$total] $*"
+  }
+
+  echo
+  info "开始重新加载网络服务，耗时较长的步骤会提前提示，请耐心等待。"
+
+  reload_step "读取当前配置..."
   load_config
+
+  reload_step "写入 networkd / dnsmasq / nftables / 4G 管理配置..."
   write_all_configs
+
+  reload_step "应用 sysctl 内核网络参数..."
   sysctl --system >/dev/null 2>&1 || true
+
+  reload_step "检查并应用 lte4g IPv6 RA 参数..."
   wan_has_iface lte4g && apply_lte4g_ipv6_ra_sysctl
+
+  reload_step "重新加载 systemd 服务配置..."
   systemctl daemon-reload || true
+
+  reload_step "启用 networkd / dnsmasq / nftables..."
   systemctl enable systemd-networkd dnsmasq nftables >/dev/null 2>&1 || true
+
+  reload_step "禁用 systemd-networkd-wait-online，避免无网口等待超时..."
   systemctl disable systemd-networkd-wait-online.service >/dev/null 2>&1 || true
   systemctl mask systemd-networkd-wait-online.service >/dev/null 2>&1 || true
+
+  reload_step "启动/刷新 lte4g 管理服务；这一步可能需要 20-40 秒..."
   sync_lte4g_manager_service
+
+  reload_step "重启 systemd-networkd..."
   systemctl restart systemd-networkd 2>/dev/null || warn "systemd-networkd 重启失败，请查看 journalctl -u systemd-networkd"
+
+  reload_step "加载 nftables 转发/NAT 规则..."
   load_nft_rules || true
+
+  reload_step "重启 dnsmasq / systemd-resolved..."
   systemctl restart dnsmasq 2>/dev/null || warn "dnsmasq 重启失败，请查看 journalctl -u dnsmasq"
   systemctl restart systemd-resolved 2>/dev/null || true
+
+  reload_step "启动/刷新 lte4g 策略路由服务..."
   sync_lte4g_policy_service
+
   ok "networkd / dnsmasq / nftables 已重新加载。"
 }
 
