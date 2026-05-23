@@ -609,15 +609,15 @@ format_disk_as_lxc_ext4() {
     [ "$ack" = "FORMAT ${disk}" ] || die "确认文本不匹配，已取消格式化。"
 
     unmount_disk_partitions "$disk"
-    wipefs -a "$disk"
-    parted -s "$disk" mklabel gpt
-    parted -s "$disk" mkpart primary ext4 1MiB 100%
-    partprobe "$disk" || true
-    command_exists udevadm && udevadm settle || true
+    wipefs -a "$disk" >&2
+    parted -s "$disk" mklabel gpt >&2
+    parted -s "$disk" mkpart primary ext4 1MiB 100% >&2
+    partprobe "$disk" >&2 || true
+    command_exists udevadm && udevadm settle >&2 || true
     sleep 2
     part="$(partition_of_disk "$disk")"
     [ -b "$part" ] || die "创建分区后未找到 $part。"
-    mkfs.ext4 -F -L EasePiR2_LXC "$part"
+    mkfs.ext4 -F -L EasePiR2_LXC "$part" >&2
     echo "$part"
 }
 
@@ -668,7 +668,7 @@ prepare_ext4_target() {
                 warn "$dev 没有文件系统。"
                 read -r -p "如确认格式化，请输入：FORMAT ${dev} : " ack || ack=""
                 [ "$ack" = "FORMAT ${dev}" ] || die "确认文本不匹配，已取消格式化。"
-                mkfs.ext4 -F -L EasePiR2_LXC "$dev"
+                mkfs.ext4 -F -L EasePiR2_LXC "$dev" >&2
                 echo "$dev"
             else
                 case "$fstype" in
