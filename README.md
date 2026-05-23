@@ -156,7 +156,7 @@ bash 1.sh
 <details>
 <summary><code>2.sh</code>：Redroid 一键部署与容器管理</summary>
 
-`2.sh` 用来在精简 LiteHost 上后装 Docker / Redroid 运行环境，避免把 Redroid 全套依赖提前塞进镜像构建阶段。
+`2.sh` 用来在精简 LiteHost 上后装 Docker / Redroid 运行环境，避免把 Redroid 全套依赖提前塞进镜像构建阶段。脚本会按内核自动补 GPU 用户态包：vendor 6.1 安装 libmali 路线，6.18 / 7.0 安装 Mesa / Vulkan 路线。
 
 ### 菜单功能
 
@@ -192,6 +192,7 @@ bash 2.sh
 
 - 建议先用 `1.sh` 安装并启动 OpenWrt，让宿主存在 `br-hostlan` 后再安装 Redroid。
 - Docker 目录管理不会静默格式化磁盘，格式化前需要手工输入确认文本。
+- `slim` 镜像不会预装 GPU 用户态包，首次执行 `2.sh` 的依赖安装会自动补齐。
 - Redroid 依赖和 Docker 体积较大，放到 `2.sh` 后装可以显著减少 LiteHost 精简镜像的编译时间。
 
 </details>

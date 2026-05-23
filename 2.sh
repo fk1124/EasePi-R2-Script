@@ -27,6 +27,10 @@ REDROID_WIDTH="${REDROID_WIDTH:-1080}"
 REDROID_HEIGHT="${REDROID_HEIGHT:-1920}"
 REDROID_DPI="${REDROID_DPI:-480}"
 
+LIBMALI_DEB_URL="${LIBMALI_DEB_URL:-https://github.com/tsukumijima/libmali-rockchip/releases/download/v1.9-1-20260312-bd33ee2/libmali-valhall-g610-g24p0-gbm_1.9-1_arm64.deb}"
+LIBMALI_DEB_SHA256="${LIBMALI_DEB_SHA256:-32ffe853e8d56295284637252f1da15dd868a8f7c6b8da6b9f77616ba285eb1a}"
+GPU_CACHE_DIR="${GPU_CACHE_DIR:-/var/cache/easepi-r2-redroid}"
+
 ok() { echo "[OK] $*"; }
 info() { echo "[INFO] $*"; }
 warn() { echo "[WARN] $*" >&2; }
@@ -133,6 +137,84 @@ apt_install_optional() {
     done
 }
 
+detect_gpu_stack() {
+    local kernel
+    kernel="$(uname -r 2>/dev/null || true)"
+    case "$kernel" in
+        *vendor*|*rk35xx*|6.1.*)
+            printf '%s\n' vendor
+            ;;
+        *)
+            printf '%s\n' mainline
+            ;;
+    esac
+}
+
+has_libmali() {
+    dpkg-query -W -f='${Status}' libmali-valhall-g610-g24p0-gbm 2>/dev/null | grep -q 'install ok installed' && return 0
+    ldconfig -p 2>/dev/null | grep -qi 'libmali' && return 0
+    return 1
+}
+
+install_vendor_libmali() {
+    local deb_name deb_path tmp_path
+
+    if has_libmali; then
+        ok "vendor 6.1 libmali 已安装。"
+        return 0
+    fi
+
+    deb_name="$(basename "$LIBMALI_DEB_URL")"
+    deb_path="${GPU_CACHE_DIR}/${deb_name}"
+    tmp_path="${deb_path}.tmp"
+    mkdir -p "$GPU_CACHE_DIR"
+
+    if [ ! -f "$deb_path" ]; then
+        info "正在下载 vendor 6.1 libmali：$LIBMALI_DEB_URL"
+        curl -fL --retry 3 --connect-timeout 15 -o "$tmp_path" "$LIBMALI_DEB_URL"
+        mv -f "$tmp_path" "$deb_path"
+    fi
+
+    printf '%s  %s\n' "$LIBMALI_DEB_SHA256" "$deb_path" | sha256sum -c -
+    if ! DEBIAN_FRONTEND=noninteractive dpkg -i "$deb_path"; then
+        DEBIAN_FRONTEND=noninteractive apt-get -f install -y
+    fi
+
+    ok "vendor 6.1 libmali 已安装。"
+}
+
+install_gpu_userspace() {
+    local stack
+    local -a core optional missing_core missing_optional
+
+    stack="$(detect_gpu_stack)"
+    echo
+    echo "========== 检测 GPU 用户态包 =========="
+    echo "检测到 GPU 栈：$stack"
+
+    if [ "$stack" = vendor ]; then
+        core=(libdrm2 libgbm1 ocl-icd-libopencl1 clinfo v4l-utils ca-certificates curl)
+        optional=()
+    else
+        core=(libdrm2 libegl-mesa0 libgles2 libgl1-mesa-dri mesa-vulkan-drivers v4l-utils)
+        optional=(mesa-utils vulkan-tools kmscube glmark2-es2-drm ocl-icd-libopencl1 clinfo)
+    fi
+
+    mapfile -t missing_core < <(dpkg_missing_packages "${core[@]}")
+    mapfile -t missing_optional < <(dpkg_missing_packages "${optional[@]}")
+    if [ "${#missing_core[@]}" -gt 0 ] || [ "${#missing_optional[@]}" -gt 0 ]; then
+        apt-get update
+    fi
+    [ "${#missing_core[@]}" -eq 0 ] || apt_install_required "${core[@]}"
+    [ "${#missing_optional[@]}" -eq 0 ] || apt_install_optional "${optional[@]}"
+
+    if [ "$stack" = vendor ]; then
+        install_vendor_libmali || warn "libmali 安装失败，Redroid 可继续尝试，但 GPU 加速可能不可用。"
+    fi
+
+    ok "GPU 用户态包检测完成。"
+}
+
 ensure_dirs() {
     mkdir -p "$DOCKER_BASE" "$DOCKER_DATA_ROOT" "$REDROID_DATA_DIR" "$BACKUP_DIR" "$CONFIG_DIR"
 }
@@ -198,8 +280,7 @@ install_redroid_dependencies() {
         android-tools-adb
     )
     optional=(
-        android-tools-fastboot v4l-utils libdrm2 libgbm1
-        ocl-icd-libopencl1 clinfo docker-compose-plugin
+        android-tools-fastboot docker-compose-plugin
     )
 
     echo
@@ -224,6 +305,7 @@ install_redroid_dependencies() {
         apt_install_optional "${optional[@]}"
     fi
 
+    install_gpu_userspace
     ensure_dirs
     write_docker_daemon
     systemctl enable --now docker.service >/dev/null 2>&1 || systemctl restart docker.service || true
@@ -535,6 +617,13 @@ show_status() {
     echo
     echo "Redroid 模块："
     lsmod | grep -E 'binder|ashmem|overlay|br_netfilter|veth' || true
+    echo
+    echo "GPU 用户态："
+    echo "  GPU 栈：$(detect_gpu_stack)"
+    dpkg-query -W -f='  ${binary:Package} ${Version}\n' \
+        libmali-valhall-g610-g24p0-gbm libdrm2 libgbm1 libegl-mesa0 libgles2 \
+        libgl1-mesa-dri mesa-vulkan-drivers 2>/dev/null || true
+    command -v clinfo >/dev/null 2>&1 && clinfo -l 2>/dev/null | sed 's/^/  /' || true
 }
 
 main_menu() {
