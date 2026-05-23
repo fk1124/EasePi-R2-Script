@@ -15,6 +15,7 @@ cd /root && rm -rf /tmp/EasePi-R2-Script && git clone --depth=1 https://github.c
 ```bash
 bash 0.sh
 bash 1.sh
+bash 2.sh
 bash 9.sh
 ```
 
@@ -24,7 +25,7 @@ bash 9.sh
 | --- | --- | --- |
 | `0.sh` | 可用 | EasePi-R2 Debian / Armbian 宿主网络管理 |
 | `1.sh` | 可用 | LXC 专属一键布置与容器管理 |
-| `2.sh` | 预留 | 待定义 |
+| `2.sh` | 可用 | Redroid 一键部署与容器管理 |
 | `3.sh` | 预留 | 待定义 |
 | `4.sh` | 预留 | 待定义 |
 | `5.sh` | 预留 | 待定义 |
@@ -153,9 +154,45 @@ bash 1.sh
 </details>
 
 <details>
-<summary><code>2.sh</code>：预留脚本</summary>
+<summary><code>2.sh</code>：Redroid 一键部署与容器管理</summary>
 
-当前为空文件，保留给后续功能。
+`2.sh` 用来在精简 LiteHost 上后装 Docker / Redroid 运行环境，避免把 Redroid 全套依赖提前塞进镜像构建阶段。
+
+### 菜单功能
+
+```text
+1. 一键检测并安装 Redroid 所有依赖（含 Docker）
+2. Docker 目录管理
+3. Redroid 镜像管理
+4. 一键安装 Redroid（桥接到 br-hostlan）
+5. Redroid 备份 / 还原
+s. 查看当前状态
+0. 退出
+```
+
+### 默认规划
+
+```text
+Docker 根目录：/docker
+Docker data-root：/docker/data
+Redroid 数据目录：/docker/redroid-data
+备份目录：/docker/backups
+默认网络：通过 macvlan 接到 br-hostlan
+默认 IP：10.10.0.50
+```
+
+### 执行方式
+
+```bash
+cd /root
+bash 2.sh
+```
+
+### 注意
+
+- 建议先用 `1.sh` 安装并启动 OpenWrt，让宿主存在 `br-hostlan` 后再安装 Redroid。
+- Docker 目录管理不会静默格式化磁盘，格式化前需要手工输入确认文本。
+- Redroid 依赖和 Docker 体积较大，放到 `2.sh` 后装可以显著减少 LiteHost 精简镜像的编译时间。
 
 </details>
 

@@ -197,7 +197,11 @@ install_lxc_dependencies() {
 }
 
 check_openwrt_kmods() {
-    local modules ok_modules missing_modules mod
+    local packages missing_packages modules ok_modules missing_modules mod
+    packages=(
+        kmod iproute2 iputils-ping ethtool bridge-utils
+        iptables nftables ebtables arptables conntrack ipset
+    )
     modules=(
         bridge br_netfilter veth tun overlay 8021q
         nf_tables nf_conntrack nf_nat nft_chain_nat nft_masq nft_redir
@@ -212,6 +216,18 @@ check_openwrt_kmods() {
 
     echo
     echo "========== 检测 OpenWrt LXC 所需宿主内核能力 =========="
+    mapfile -t missing_packages < <(dpkg_missing_packages "${packages[@]}")
+    if [ "${#missing_packages[@]}" -gt 0 ]; then
+        echo "缺少以下 OpenWrt 宿主辅助包："
+        printf '  - %s\n' "${missing_packages[@]}"
+        if confirm "是否一键安装这些辅助包？" y; then
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing_packages[@]}"
+        else
+            warn "已取消安装辅助包，仅继续检测当前内核模块。"
+        fi
+    fi
+
     if ! dpkg-query -W -f='${Status}' kmod 2>/dev/null | grep -q 'install ok installed'; then
         apt-get update
         DEBIAN_FRONTEND=noninteractive apt-get install -y kmod

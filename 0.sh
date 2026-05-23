@@ -2180,10 +2180,14 @@ install_all_deps(){
   local -a deps missing installed
   local pkg
   deps=(
-    iproute2 ethtool bridge-utils dnsmasq nftables
+    iproute2 iputils-ping ethtool bridge-utils
+    dnsmasq nftables iptables ebtables arptables conntrack ipset
     openssh-server curl ca-certificates systemd-resolved
+    tcpdump socat iperf3
+    ppp pppoe
     iw wireless-regdb wpasupplicant hostapd rfkill jq openssl
-    kmod usbutils modemmanager usb-modeswitch
+    kmod usbutils pciutils modemmanager usb-modeswitch
+    rsync zstd xz-utils unzip
   )
   missing=()
   installed=()
