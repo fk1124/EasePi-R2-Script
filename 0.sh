@@ -1312,23 +1312,31 @@ PRIO="${3:-1004}"
 sysctl -w "net.ipv6.conf.$IFACE.accept_ra=2" >/dev/null 2>&1 || true
 sysctl -w "net.ipv6.conf.$IFACE.autoconf=1" >/dev/null 2>&1 || true
 
-ADDR4="$(ip -o -4 addr show dev "$IFACE" scope global 2>/dev/null | awk '{print $4; exit}')"
-ADDR4_IP="${ADDR4%/*}"
-
-ADDR6="$(ip -o -6 addr show dev "$IFACE" scope global 2>/dev/null | awk '!/ temporary / {print $4; exit}')"
-[ -n "$ADDR6" ] || ADDR6="$(ip -o -6 addr show dev "$IFACE" scope global 2>/dev/null | awk '{print $4; exit}')"
-ADDR6_IP="${ADDR6%/*}"
-
 IFINDEX="$(cat "/sys/class/net/$IFACE/ifindex" 2>/dev/null || true)"
 LEASE="/run/systemd/netif/leases/$IFINDEX"
 ROUTER=""
-if [ -r "$LEASE" ]; then
-  ROUTER="$(awk -F= '$1=="ROUTER"{print $2; exit}' "$LEASE")"
-  ROUTER="${ROUTER%% *}"
-fi
-[ -n "$ROUTER" ] || ROUTER="$(ip -4 route show default dev "$IFACE" 2>/dev/null | awk '{print $3; exit}')"
+ADDR4=""
+ADDR4_IP=""
+ADDR6=""
+ADDR6_IP=""
+ROUTER6=""
 
-ROUTER6="$(ip -6 route show default dev "$IFACE" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')"
+for _ in $(seq 1 20); do
+  ADDR4="$(ip -o -4 addr show dev "$IFACE" scope global 2>/dev/null | awk '{print $4; exit}')"
+  ADDR4_IP="${ADDR4%/*}"
+  ADDR6="$(ip -o -6 addr show dev "$IFACE" scope global 2>/dev/null | awk '!/ temporary / {print $4; exit}')"
+  [ -n "$ADDR6" ] || ADDR6="$(ip -o -6 addr show dev "$IFACE" scope global 2>/dev/null | awk '{print $4; exit}')"
+  ADDR6_IP="${ADDR6%/*}"
+  ROUTER=""
+  if [ -r "$LEASE" ]; then
+    ROUTER="$(awk -F= '$1=="ROUTER"{print $2; exit}' "$LEASE")"
+    ROUTER="${ROUTER%% *}"
+  fi
+  [ -n "$ROUTER" ] || ROUTER="$(ip -4 route show default dev "$IFACE" 2>/dev/null | awk '{print $3; exit}')"
+  ROUTER6="$(ip -6 route show default dev "$IFACE" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')"
+  [ -n "$ADDR4_IP" ] && [ -n "$ROUTER" ] && [ -n "$ADDR6_IP" ] && break
+  sleep 1
+done
 
 while ip -4 rule del priority "$PRIO" 2>/dev/null; do :; done
 while ip -6 rule del priority "$PRIO" 2>/dev/null; do :; done
@@ -1525,9 +1533,9 @@ reload_lte4g_services(){
   networkctl reconfigure lte4g >/dev/null 2>&1 || true
 
   reload_step "启动/刷新 lte4g 管理服务..."
+  apply_lte4g_ipv6_ra_sysctl
   sync_lte4g_manager_service
   apply_lte4g_ipv6_ra_sysctl
-  networkctl reconfigure lte4g >/dev/null 2>&1 || true
 
   reload_step "启动/刷新 lte4g 策略路由服务..."
   sync_lte4g_policy_service
