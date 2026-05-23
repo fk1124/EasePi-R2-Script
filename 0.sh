@@ -98,6 +98,14 @@ remove_lan_iface(){
   LAN_IFACES="$result"
 }
 
+add_nat_out_iface(){
+  local target="$1" word
+  for word in $NAT_OUT; do
+    [ "$word" = "$target" ] && return 0
+  done
+  NAT_OUT="${NAT_OUT:+$NAT_OUT }$target"
+}
+
 prefix_to_mask(){
   local prefix="${1:-24}" out="" full rem i val
   full=$((prefix/8))
@@ -913,7 +921,7 @@ $(for d in $dns_list; do echo "DNS=$d"; done)
 
 [DHCPv4]
 UseDNS=no
-$(if [ "$ifname" = lte4g ]; then echo "UseRoutes=no"; echo "RouteMetric=$metric"; else echo "RouteMetric=$metric"; fi)
+$(if [ "$ifname" = lte4g ]; then echo "UseRoutes=yes"; echo "RouteMetric=$metric"; else echo "RouteMetric=$metric"; fi)
 EOF_WAN_DHCP
       if [ "$ifname" = lte4g ]; then
         cat >> "$network_file" <<EOF_LTE_RA
@@ -958,7 +966,7 @@ $(for d in $dns_list; do echo "DNS=$d"; done)
 
 [DHCPv4]
 UseDNS=no
-UseRoutes=no
+UseRoutes=yes
 RouteMetric=$metric
 
 [IPv6AcceptRA]
@@ -2189,13 +2197,14 @@ local_network_router_menu(){
 enable_lte4g(){
   need_root
   load_config
-  LTE4G_METRIC="$(read_default "lte4g DHCP 路由 metric，默认不把 LTE 当作备用出网" "$LTE4G_METRIC")"
+  LTE4G_METRIC="$(read_default "lte4g 备用 WAN 默认路由 metric，建议高于 eth0" "$LTE4G_METRIC")"
   if ! echo "$WAN_CONFIG" | awk -F'|' '$1=="lte4g"{found=1} END{exit !found}'; then
     WAN_CONFIG="${WAN_CONFIG:+$WAN_CONFIG
 }lte4g|dhcp|$LTE4G_METRIC|||$DEVICE_DNS"
   else
     WAN_CONFIG="$(echo "$WAN_CONFIG" | awk -F'|' -v m="$LTE4G_METRIC" 'BEGIN{OFS="|"} $1=="lte4g"{$2="dhcp";$3=m} {print}')"
   fi
+  [ "${ROUTER_MODE:-no}" = yes ] && add_nat_out_iface lte4g
   guide_networkd_iface_conflicts lte4g
   if [ "${ROUTER_MODE:-no}" = yes ]; then
     write_all_configs
@@ -2203,8 +2212,8 @@ enable_lte4g(){
     write_lte4g_configs
   fi
   info "功能 10 会安装 lte4g manager：自动拨起 ML307R RNDIS，并刷新 IPv4/IPv6 管理入口路由。"
-  info "lte4g 会通过 DHCPv4 + IPv6 RA 获取双栈地址；IPv4 不加入主默认路由。"
-  info "脚本会启用 IPv4/IPv6 策略路由：从 LTE 地址进入 R2 的 SSH，回复包仍从 lte4g 返回。"
+  info "lte4g 会通过 DHCPv4 + IPv6 RA 获取双栈地址，并以高 metric 加入主默认路由作为备用 WAN。"
+  info "脚本仍会启用 IPv4/IPv6 策略路由：从 LTE 地址进入 R2 的 SSH，回复包仍从 lte4g 返回。"
   info "提示：下面直接回车，或只输入空格再回车，都会按 Y 处理。"
   if confirm "是否立即重新加载服务？" y; then
     if [ "${ROUTER_MODE:-no}" = yes ]; then
