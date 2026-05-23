@@ -1534,6 +1534,34 @@ configure_metric(){
   pause
 }
 
+local_network_router_menu(){
+  while true; do
+    clear 2>/dev/null || true
+    echo "============================================================"
+    echo " 本地网络路由管理"
+    echo "============================================================"
+    echo "1. WAN 口配置"
+    echo "2. LAN 口配置"
+    echo "3. DHCP 配置"
+    echo "4. DNS 配置"
+    echo "5. 修改 NAT 出口"
+    echo "6. 修改默认路由跃点"
+    echo "0. 返回"
+    echo "============================================================"
+    read -r -p "请选择：" choice
+    case "$choice" in
+      1) configure_wan ;;
+      2) configure_lan ;;
+      3) configure_dhcp ;;
+      4) configure_dns ;;
+      5) configure_nat ;;
+      6) configure_metric ;;
+      0) return ;;
+      *) warn "无效选择"; sleep 1 ;;
+    esac
+  done
+}
+
 enable_lte4g(){
   need_root
   load_config
@@ -1703,7 +1731,45 @@ wifi_menu(){
 
 install_all_deps(){
   need_root
-  install_packages iproute2 ethtool bridge-utils dnsmasq nftables openssh-server curl ca-certificates systemd-resolved iw wireless-regdb wpasupplicant hostapd rfkill
+  local -a deps missing installed
+  local pkg
+  deps=(
+    iproute2 ethtool bridge-utils dnsmasq nftables
+    openssh-server curl ca-certificates systemd-resolved
+    iw wireless-regdb wpasupplicant hostapd rfkill
+    kmod usbutils modemmanager usb-modeswitch
+  )
+  missing=()
+  installed=()
+
+  echo "正在检测网络依赖..."
+  for pkg in "${deps[@]}"; do
+    if dpkg -s "$pkg" >/dev/null 2>&1; then
+      installed+=("$pkg")
+    else
+      missing+=("$pkg")
+    fi
+  done
+
+  echo
+  ok "已安装：${#installed[@]} 个"
+  if [ "${#installed[@]}" -gt 0 ]; then
+    printf '  %s\n' "${installed[@]}"
+  fi
+
+  echo
+  if [ "${#missing[@]}" -eq 0 ]; then
+    ok "所有网络依赖都已安装，无需重复安装。"
+    pause
+    return
+  fi
+
+  warn "缺少以下网络依赖：${#missing[@]} 个"
+  printf '  %s\n' "${missing[@]}"
+  echo
+  confirm "是否一键安装缺少的网络依赖？" y || { warn "已取消安装。"; pause; return; }
+
+  install_packages "${missing[@]}"
   systemctl enable systemd-networkd dnsmasq nftables ssh 2>/dev/null || true
   ok "网络依赖已安装。"
   pause
@@ -1922,40 +1988,30 @@ main_menu(){
     echo "============================================================"
     echo " EasePi-R2 中文网络管理器  $VERSION"
     echo "============================================================"
-    echo "1. 智能识别系统并切换国内 APT 加速源"
-    echo "2. SSH-root 一键开启"
-    echo "3. 查看当前网络配置"
-    echo "4. WAN 口配置"
-    echo "5. LAN 口配置"
-    echo "6. DHCP 配置"
-    echo "7. DNS 配置"
-    echo "8. 修改 NAT 出口"
-    echo "9. 修改默认路由跃点"
-    echo "10. 开启 lte4g 管理入口"
-    echo "11. wlan 设置"
-    echo "12. 重新加载 networkd / dnsmasq / nftables"
-    echo "13. 一键安装所有网络依赖"
-    echo "14. 一键扩容 rootfs"
-    echo "15. 设置备份及恢复"
+    echo "1. 一键检测并切换APT软件源"
+    echo "2. 一键检测并安装所有网络依赖"
+    echo "3. 一键开启SSH-ROOT用户登录"
+    echo "4. 一键查看当前网络配置"
+    echo "5. 本地网络路由管理"
+    echo "6. 4G网络管理"
+    echo "7. 无线网络管理"
+    echo "8. 重新加载 networkd / dnsmasq / nftables"
+    echo "9. 一键扩容 rootfs"
+    echo "10. 设置备份及恢复"
     echo "0. 退出"
     echo "============================================================"
     read -r -p "请选择：" choice
     case "$choice" in
       1) configure_apt_mirror ;;
-      2) configure_ssh_root ;;
-      3) show_network ;;
-      4) configure_wan ;;
-      5) configure_lan ;;
-      6) configure_dhcp ;;
-      7) configure_dns ;;
-      8) configure_nat ;;
-      9) configure_metric ;;
-      10) enable_lte4g ;;
-      11) wifi_menu ;;
-      12) backup_now 重载 >/dev/null; reload_services; pause ;;
-      13) install_all_deps ;;
-      14) expand_rootfs ;;
-      15) backup_menu ;;
+      2) install_all_deps ;;
+      3) configure_ssh_root ;;
+      4) show_network ;;
+      5) local_network_router_menu ;;
+      6) enable_lte4g ;;
+      7) wifi_menu ;;
+      8) backup_now 重载 >/dev/null; reload_services; pause ;;
+      9) expand_rootfs ;;
+      10) backup_menu ;;
       0) exit 0 ;;
       *) warn "无效选择"; sleep 1 ;;
     esac
