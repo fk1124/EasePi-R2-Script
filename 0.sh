@@ -50,6 +50,7 @@ confirm(){
   local prompt="$1" def="${2:-y}" val hint
   [ "$def" = y ] && hint="Y/n" || hint="y/N"
   read -r -p "$prompt [$hint]: " val
+  val="$(trim "$val")"
   val="${val:-$def}"
   case "${val,,}" in
     y|yes|是|好|确认|ok) return 0 ;;
@@ -1326,6 +1327,53 @@ reload_services(){
   ok "networkd / dnsmasq / nftables 已重新加载。"
 }
 
+test_lte4g_connectivity(){
+  local iface="${1:-lte4g}" ipv4_target="${LTE4G_TEST_IPV4:-223.5.5.5}" ipv6_target="${LTE4G_TEST_IPV6:-2400:3200::1}"
+  local tmp4 tmp6 v4_ok=1 v6_ok=1
+
+  echo
+  info "正在通过 $iface 测试外网 IPv4/IPv6 连通性..."
+  if [ ! -d "/sys/class/net/$iface" ]; then
+    err "$iface 不存在，lte4g 开启失败。"
+    return 1
+  fi
+
+  systemctl start easepi-r2-lte4g-manager.service >/dev/null 2>&1 || true
+  systemctl start easepi-r2-lte4g-policy-route.service >/dev/null 2>&1 || true
+  if [ -x "$LTE_POLICY_SCRIPT" ]; then
+    "$LTE_POLICY_SCRIPT" "$iface" "$LTE_POLICY_TABLE" "$LTE_POLICY_PRIO" >/dev/null 2>&1 || true
+  fi
+  sleep 2
+
+  ip -br addr show "$iface" 2>/dev/null | sed 's/^/  /' || true
+
+  tmp4="$(mktemp)"
+  tmp6="$(mktemp)"
+  echo
+  info "IPv4 测试：ping -4 -I $iface -c 3 -W 3 $ipv4_target"
+  if ping -4 -I "$iface" -c 3 -W 3 "$ipv4_target" >"$tmp4" 2>&1; then
+    v4_ok=0
+  fi
+  sed 's/^/  /' "$tmp4"
+
+  echo
+  info "IPv6 测试：ping -6 -I $iface -c 3 -W 3 $ipv6_target"
+  if ping -6 -I "$iface" -c 3 -W 3 "$ipv6_target" >"$tmp6" 2>&1; then
+    v6_ok=0
+  fi
+  sed 's/^/  /' "$tmp6"
+  rm -f "$tmp4" "$tmp6"
+
+  if [ "$v4_ok" -eq 0 ] && [ "$v6_ok" -eq 0 ]; then
+    ok "lte4g 开启成功：IPv4 和 IPv6 外网均已 ping 通。"
+    return 0
+  fi
+
+  err "lte4g 开启失败：IPv4 或 IPv6 外网 ping 不通。"
+  warn "可查看：journalctl -u easepi-r2-lte4g-manager.service -u easepi-r2-lte4g-policy-route.service --no-pager -n 80"
+  return 1
+}
+
 show_network(){
   load_config
   clear 2>/dev/null || true
@@ -1501,7 +1549,13 @@ enable_lte4g(){
   info "功能 10 会安装 lte4g manager：自动拨起 ML307R RNDIS，并刷新 IPv4/IPv6 管理入口路由。"
   info "lte4g 会通过 DHCPv4 + IPv6 RA 获取双栈地址；IPv4 不加入主默认路由。"
   info "脚本会启用 IPv4/IPv6 策略路由：从 LTE 地址进入 R2 的 SSH，回复包仍从 lte4g 返回。"
-  confirm "是否立即重新加载服务？" y && reload_services
+  info "提示：下面直接回车，或只输入空格再回车，都会按 Y 处理。"
+  if confirm "是否立即重新加载服务？" y; then
+    reload_services
+    test_lte4g_connectivity lte4g || true
+  else
+    warn "已写入配置，但尚未重新加载服务；暂不进行 lte4g 外网检测。"
+  fi
   pause
 }
 
