@@ -1495,6 +1495,139 @@ list_containers() {
     fi
 }
 
+default_openwrt_container_name() {
+    local name first
+    for name in openwrt24 openwrt25 openwrt; do
+        if [ -d "$(container_dir_for "$name")" ]; then
+            echo "$name"
+            return 0
+        fi
+    done
+    first="$(find "$CONTAINER_DIR" -mindepth 1 -maxdepth 1 -type d -name 'openwrt*' -printf '%f\n' 2>/dev/null | sort | head -n1 || true)"
+    echo "${first:-openwrt24}"
+}
+
+select_openwrt_container() {
+    local default name
+    echo
+    echo "========== OpenWrt 容器 =========="
+    list_containers || true
+    default="$(default_openwrt_container_name)"
+    name="$(read_default "OpenWrt 容器名称" "$default")"
+    [ -n "$name" ] || die "容器名称不能为空。"
+    [ -d "$(container_dir_for "$name")" ] || die "容器不存在：$name"
+
+    if ! container_running "$name"; then
+        if confirm "容器 $name 未运行，是否启动？" y; then
+            lxc-start -P "$CONTAINER_DIR" -n "$name" -d
+            sleep 3
+        else
+            die "容器未运行，无法继续。"
+        fi
+    fi
+    SELECTED_OPENWRT_CT="$name"
+}
+
+run_in_openwrt_container() {
+    local name="$1"
+    shift || true
+    lxc-attach -P "$CONTAINER_DIR" -n "$name" -- /bin/sh "$@"
+}
+
+prepare_openwrt_lxc_plugin_runtime() {
+    local name pkg
+    select_openwrt_container
+    name="$SELECTED_OPENWRT_CT"
+
+    check_openwrt_kmods
+
+    echo
+    echo "========== 准备 OpenWrt LXC 插件环境 =========="
+    run_in_openwrt_container "$name" -s <<'EOS'
+set -u
+
+ok() { echo "[OK] $*"; }
+warn() { echo "[WARN] $*" >&2; }
+installed() { opkg status "$1" 2>/dev/null | grep -q 'Status: install ok installed'; }
+
+[ -r /etc/openwrt_release ] || { warn "当前容器不像 OpenWrt。"; exit 1; }
+command -v opkg >/dev/null 2>&1 || { warn "未找到 opkg。"; exit 1; }
+
+echo "OpenWrt: $(. /etc/openwrt_release; echo "$DISTRIB_DESCRIPTION")"
+echo "运行内核: $(uname -r)"
+if opkg status kernel >/tmp/easepi-kernel-status 2>/dev/null; then
+    echo "opkg kernel: $(awk '/^Version:/{print $2; exit}' /tmp/easepi-kernel-status)"
+fi
+rm -f /tmp/easepi-kernel-status
+
+for conf in /etc/opkg/distfeeds.conf /etc/opkg/customfeeds.conf; do
+    [ -f "$conf" ] || continue
+    if grep -qE '^[[:space:]]*src/gz[[:space:]]+[^[:space:]]*kmods?[[:space:]]+' "$conf"; then
+        [ -f "${conf}.easepi-lxc.bak" ] || cp -a "$conf" "${conf}.easepi-lxc.bak"
+        sed -i -E 's|^[[:space:]]*(src/gz[[:space:]]+[^[:space:]]*kmods?[[:space:]]+.*)$|# disabled-by-easepi-lxc: \1|' "$conf"
+        rm -f /var/opkg-lists/*kmod* /var/opkg-lists/*Kmod* 2>/dev/null || true
+        ok "已禁用 $conf 里的 OpenWrt kmod 源，避免安装与宿主内核不匹配的 .ko。"
+    fi
+done
+
+opkg update || warn "opkg update 失败，请检查网络或软件源。"
+
+if installed dnsmasq-full; then
+    ok "dnsmasq-full 已安装。"
+else
+    if installed dnsmasq; then
+        /etc/init.d/dnsmasq stop >/dev/null 2>&1 || true
+        opkg remove dnsmasq --force-depends || warn "移除 dnsmasq 失败，稍后安装 dnsmasq-full 可能冲突。"
+    fi
+    opkg install dnsmasq-full && ok "dnsmasq-full 已安装。" || warn "dnsmasq-full 安装失败。"
+    /etc/init.d/dnsmasq enable >/dev/null 2>&1 || true
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+fi
+
+failed=""
+for p in coreutils coreutils-base64 coreutils-nohup curl ip-full libuci-lua lua luci-compat luci-lib-jsonc luci-lua-runtime resolveip ca-bundle ca-certificates unzip chinadns-ng dns2socks microsocks tcping lyaml; do
+    if installed "$p"; then
+        continue
+    fi
+    if ! opkg install "$p"; then
+        failed="$failed $p"
+    fi
+done
+
+if [ -n "$failed" ]; then
+    warn "以下用户态依赖未安装成功，通常是对应软件源未添加或网络失败：$failed"
+else
+    ok "Passwall 常用用户态依赖已准备。"
+fi
+
+echo
+echo "宿主内核能力可见性："
+for m in nf_tables nft_tproxy nft_socket nf_tproxy_ipv4 nf_tproxy_ipv6 xt_TPROXY xt_socket nft_chain_nat nf_nat tun wireguard; do
+    if grep -qw "$m" /proc/modules; then
+        echo "  [OK] $m"
+    else
+        echo "  [WARN] $m 未加载"
+    fi
+done
+EOS
+
+    echo
+    if confirm "是否现在安装/修复 luci-app-passwall（会跳过 kmod 依赖检查）？" n; then
+        pkg="$(read_default "Passwall 包名" "luci-app-passwall")"
+        case "$pkg" in
+            ""|*[!A-Za-z0-9._+-]*) die "包名不合法：$pkg" ;;
+        esac
+        run_in_openwrt_container "$name" -s <<EOS
+set -u
+opkg update || true
+opkg install --force-depends "$pkg"
+/etc/init.d/rpcd restart >/dev/null 2>&1 || true
+/etc/init.d/uhttpd restart >/dev/null 2>&1 || true
+echo "[OK] $pkg 安装流程已执行。"
+EOS
+    fi
+}
+
 backup_container() {
     local name dir file
     list_containers
@@ -1581,6 +1714,7 @@ main_menu() {
         echo "8. 一键安装 Debian 13 Trixie"
         echo "9. 一键安装 Ubuntu 24.04 Noble"
         echo "10. LXC 备份 / 还原"
+        echo "11. OpenWrt LXC 插件/Passwall 准备"
         echo "s. 查看当前状态"
         echo "0. 退出"
         read -r -p "请选择: " choice || exit 0
@@ -1595,6 +1729,7 @@ main_menu() {
             8) install_linux_container debian13; pause_enter ;;
             9) install_linux_container ubuntu24; pause_enter ;;
             10) backup_restore_menu ;;
+            11) prepare_openwrt_lxc_plugin_runtime; pause_enter ;;
             s|S) show_status; pause_enter ;;
             0) exit 0 ;;
             *) warn "无效选择。" ;;
