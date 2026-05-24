@@ -1288,7 +1288,7 @@ EOF_LTE_MANAGER_SERVICE
 Description=Refresh EasePi-R2 lte4g ML307R dial state
 
 [Timer]
-OnBootSec=45s
+OnBootSec=10s
 OnUnitActiveSec=5min
 AccuracySec=15s
 Unit=easepi-r2-lte4g-manager.service
@@ -1668,12 +1668,26 @@ urlencode(){
   jq -nr --arg v "$1" '$v|@uri' | sed 's/%7E/~/g'
 }
 
-get_iface_ipv6(){
+get_iface_ipv6_once(){
   local ip
   ip="$(ip -6 -o addr show dev "$DDNS_IFACE" scope global 2>/dev/null | awk '!/ temporary / && !/ deprecated / {split($4,a,"/"); print a[1]; exit}')"
   [ -n "$ip" ] || ip="$(ip -6 -o addr show dev "$DDNS_IFACE" scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}')"
   [ -n "$ip" ] || return 1
   printf '%s\n' "$ip"
+}
+
+get_iface_ipv6(){
+  local wait="${DDNS_WAIT_SECONDS:-90}" elapsed=0 ip
+  while [ "$elapsed" -le "$wait" ]; do
+    ip="$(get_iface_ipv6_once 2>/dev/null || true)"
+    if [ -n "$ip" ]; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
+    sleep 3
+    elapsed=$((elapsed + 3))
+  done
+  return 1
 }
 
 rr_from_domain(){
