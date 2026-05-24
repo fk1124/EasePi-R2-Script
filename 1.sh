@@ -1657,6 +1657,125 @@ echo "[OK] Passwall 一键安装流程已执行。"
 EOS
 }
 
+install_openwrt_lxc_easytier() {
+    local name
+    select_openwrt_container
+    name="$SELECTED_OPENWRT_CT"
+
+    check_openwrt_kmods
+
+    echo
+    echo "========== 一键安装 EasyTier =========="
+    run_in_openwrt_container "$name" -s <<'EOS'
+set -u
+
+ok() { echo "[OK] $*"; }
+warn() { echo "[WARN] $*" >&2; }
+installed() { opkg status "$1" 2>/dev/null | grep -q 'Status: install ok installed'; }
+fetch_file() {
+    local url="$1"
+    local dst="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL -o "$dst" "$url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -O "$dst" "$url"
+    elif command -v uclient-fetch >/dev/null 2>&1; then
+        uclient-fetch -O "$dst" "$url"
+    else
+        return 1
+    fi
+}
+
+[ -r /etc/openwrt_release ] || { warn "当前容器不像 OpenWrt。"; exit 1; }
+command -v opkg >/dev/null 2>&1 || { warn "当前 EasyTier 一键安装仅支持 opkg 版 OpenWrt。"; exit 1; }
+
+. /etc/openwrt_release
+arch="$DISTRIB_ARCH"
+work="/tmp/easepi-easytier-install"
+
+echo "OpenWrt: $DISTRIB_DESCRIPTION"
+echo "运行内核: $(uname -r)"
+echo "架构: $arch"
+
+if [ ! -c /dev/net/tun ]; then
+    warn "/dev/net/tun 不存在，EasyTier 无法创建 TUN 设备。请确认 OpenWrt LXC 配置已挂载 /dev/net/tun 后重启容器。"
+    exit 1
+fi
+if grep -q '^tun[[:space:]]' /proc/modules; then
+    ok "宿主 tun 模块在容器内可见。"
+else
+    warn "未在 /proc/modules 看到 tun。若后续无法启动 EasyTier，请回宿主执行 OpenWrt Kmod 检测。"
+fi
+
+mkdir -p /usr/lib/opkg/info
+if ! installed kmod-tun; then
+    cp -a /usr/lib/opkg/status /usr/lib/opkg/status.easepi-before-virtual-kmod-tun 2>/dev/null || true
+    cat >> /usr/lib/opkg/status <<EOF
+
+Package: kmod-tun
+Version: 9999-easepi-lxc
+Status: install user installed
+Architecture: ${arch}
+Description: EasePi LXC virtual package; tun is provided by the host kernel.
+EOF
+    ok "已注册 LXC 虚拟 kmod-tun，避免安装与宿主内核不匹配的 OpenWrt kmod。"
+fi
+: > /usr/lib/opkg/info/kmod-tun.list
+[ -f /usr/lib/opkg/info/kmod-tun.control ] || cat > /usr/lib/opkg/info/kmod-tun.control <<EOF
+Package: kmod-tun
+Version: 9999-easepi-lxc
+Architecture: ${arch}
+Description: EasePi LXC virtual package; tun is provided by the host kernel.
+EOF
+
+opkg update || warn "opkg update 失败，请检查 OpenWrt 网络或软件源。"
+opkg install luci-compat unzip ca-bundle ca-certificates || warn "安装 EasyTier 基础依赖时有失败项，请查看上方 opkg 输出。"
+
+rm -rf "$work"
+mkdir -p "$work"
+cd "$work"
+
+if command -v jsonfilter >/dev/null 2>&1; then
+    tag="$(fetch_file https://api.github.com/repos/EasyTier/luci-app-easytier/releases/latest - | jsonfilter -e '@.tag_name' 2>/dev/null || true)"
+else
+    tag="$(fetch_file https://api.github.com/repos/EasyTier/luci-app-easytier/releases/latest - | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1 || true)"
+fi
+[ -n "${tag:-}" ] || tag="v2.6.4"
+url="https://github.com/EasyTier/luci-app-easytier/releases/download/${tag}/EasyTier-${tag}-${arch}-22.03.7.zip"
+
+echo "下载 EasyTier ${tag}: $url"
+if ! fetch_file "$url" easytier.zip; then
+    warn "下载 EasyTier 安装包失败。当前架构 ${arch} 可能没有对应 release asset，或无法访问 GitHub。"
+    exit 1
+fi
+unzip -o easytier.zip >/tmp/easepi-easytier-unzip.log
+
+core="$(ls easytier_[0-9]*_${arch}.ipk 2>/dev/null | head -n1 || true)"
+luci="$(ls luci-app-easytier_*.ipk 2>/dev/null | head -n1 || true)"
+i18n="$(ls luci-i18n-easytier-zh-cn_*.ipk 2>/dev/null | head -n1 || true)"
+[ -n "$core" ] && [ -n "$luci" ] && [ -n "$i18n" ] || { warn "安装包内容不完整。"; ls -l; exit 1; }
+
+opkg install "$core" "$luci" "$i18n"
+
+/etc/init.d/easytier enable >/dev/null 2>&1 || true
+/etc/init.d/easytier restart >/dev/null 2>&1 || true
+/etc/init.d/rpcd restart >/dev/null 2>&1 || true
+/etc/init.d/uhttpd restart >/dev/null 2>&1 || true
+rm -rf "$work"
+
+echo
+echo "安装结果："
+opkg list-installed | grep -E '^kmod-tun |^easytier |^luci-app-easytier|^luci-i18n-easytier|^luci-compat' || true
+if command -v easytier-core >/dev/null 2>&1; then
+    easytier-core --version
+    ok "EasyTier 核心与 LuCI 已安装。"
+else
+    warn "未找到 easytier-core，安装未完成。"
+    exit 1
+fi
+EOS
+}
+
 backup_container() {
     local name dir file
     list_containers
@@ -1744,6 +1863,7 @@ main_menu() {
         echo "9. 一键安装 Ubuntu 24.04 Noble"
         echo "10. LXC 备份 / 还原"
         echo "11. 一键安装 Passwall（LXC 兼容，含中文翻译）"
+        echo "12. 一键安装 EasyTier（LXC 兼容，含核心和中文翻译）"
         echo "s. 查看当前状态"
         echo "0. 退出"
         read -r -p "请选择: " choice || exit 0
@@ -1759,6 +1879,7 @@ main_menu() {
             9) install_linux_container ubuntu24; pause_enter ;;
             10) backup_restore_menu ;;
             11) install_openwrt_lxc_passwall; pause_enter ;;
+            12) install_openwrt_lxc_easytier; pause_enter ;;
             s|S) show_status; pause_enter ;;
             0) exit 0 ;;
             *) warn "无效选择。" ;;
