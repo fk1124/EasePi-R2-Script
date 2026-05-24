@@ -1104,6 +1104,47 @@ EOF
         fi
     } > "${rootfs_dir}/etc/config/network"
 
+    {
+        cat <<'EOF'
+{
+        "model": {
+                "id": "easepi-r2,lxc-openwrt",
+                "name": "EasePi R2 LXC OpenWrt"
+        },
+        "network": {
+                "lan": {
+                        "ports": [
+EOF
+        lan_idx=0
+        for dev in $lan_ports; do
+            [ "$lan_idx" -eq 0 ] || printf ',\n'
+            printf '                                "%s"' "$dev"
+            lan_idx=$((lan_idx + 1))
+        done
+        printf '\n'
+        cat <<'EOF'
+                        ],
+                        "protocol": "static"
+EOF
+        if [ "$WAN_IF" != "none" ]; then
+            cat <<'EOF'
+                },
+                "wan": {
+                        "device": "wan",
+                        "protocol": "dhcp"
+                }
+EOF
+        else
+            cat <<'EOF'
+                }
+EOF
+        fi
+        cat <<'EOF'
+        }
+}
+EOF
+    } > "${rootfs_dir}/etc/board.json"
+
     cat > "${rootfs_dir}/etc/config/dhcp" <<EOF
 config dnsmasq
         option domainneeded '1'
