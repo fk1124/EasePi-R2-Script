@@ -780,6 +780,10 @@ cleanup_standalone_lte4g_router_artifacts(){
   if [ "$had_dnsmasq" -eq 1 ]; then
     systemctl disable --now dnsmasq.service >/dev/null 2>&1 || true
   fi
+  if [ ! -e "$DNSMASQ_CONF" ] && [ "${ROUTER_MODE:-no}" != yes ]; then
+    systemctl disable --now dnsmasq.service >/dev/null 2>&1 || true
+    systemctl reset-failed dnsmasq.service >/dev/null 2>&1 || true
+  fi
   if ip link show br-lan >/dev/null 2>&1; then
     ip addr flush dev br-lan 2>/dev/null || true
     ip link set br-lan down 2>/dev/null || true
@@ -1270,17 +1274,13 @@ EOF_LTE_MANAGER
   cat > "$LTE_MANAGER_SERVICE" <<EOF_LTE_MANAGER_SERVICE
 [Unit]
 Description=EasePi-R2 lte4g ML307R dial and management
-After=systemd-modules-load.service systemd-udevd.service
-Before=systemd-networkd.service ModemManager.service
+After=systemd-modules-load.service systemd-udevd.service systemd-networkd.service
 Wants=systemd-networkd.service
 
 [Service]
 Type=oneshot
 ExecStart=$LTE_MANAGER_SCRIPT lte4g
-TimeoutStartSec=120
-
-[Install]
-WantedBy=multi-user.target
+TimeoutStartSec=75
 EOF_LTE_MANAGER_SERVICE
 
   cat > "$LTE_MANAGER_TIMER" <<'EOF_LTE_MANAGER_TIMER'
@@ -1288,7 +1288,7 @@ EOF_LTE_MANAGER_SERVICE
 Description=Refresh EasePi-R2 lte4g ML307R dial state
 
 [Timer]
-OnBootSec=20s
+OnBootSec=45s
 OnUnitActiveSec=5min
 AccuracySec=15s
 Unit=easepi-r2-lte4g-manager.service
@@ -1418,7 +1418,8 @@ sync_lte4g_manager_service(){
   write_lte4g_manager_files
   if wan_has_iface lte4g; then
     systemctl daemon-reload || true
-    systemctl enable easepi-r2-lte4g-manager.service >/dev/null 2>&1 || true
+    systemctl disable easepi-r2-lte4g-manager.service >/dev/null 2>&1 || true
+    systemctl reset-failed easepi-r2-lte4g-manager.service >/dev/null 2>&1 || true
     systemctl enable --now easepi-r2-lte4g-manager.timer >/dev/null 2>&1 || true
     systemctl start easepi-r2-lte4g-manager.service >/dev/null 2>&1 || true
   else
@@ -2413,6 +2414,7 @@ install_all_deps(){
   need_root
   local -a deps missing installed
   local pkg
+  load_config
   deps=(
     iproute2 iputils-ping ethtool bridge-utils
     dnsmasq nftables iptables ebtables arptables conntrack ipset
@@ -2454,7 +2456,16 @@ install_all_deps(){
   confirm "是否一键安装缺少的网络依赖？" y || { warn "已取消安装。"; pause; return; }
 
   install_packages "${missing[@]}"
-  systemctl enable systemd-networkd dnsmasq nftables ssh 2>/dev/null || true
+  systemctl enable systemd-networkd ssh 2>/dev/null || true
+  if [ -e "$DNSMASQ_CONF" ] && [ "${ROUTER_MODE:-no}" = yes ]; then
+    systemctl enable dnsmasq 2>/dev/null || true
+  else
+    systemctl disable --now dnsmasq 2>/dev/null || true
+    systemctl reset-failed dnsmasq 2>/dev/null || true
+  fi
+  if [ -e "$NFT_CONF" ] && [ "${ROUTER_MODE:-no}" = yes ]; then
+    systemctl enable nftables 2>/dev/null || true
+  fi
   ok "网络依赖已安装。"
   pause
 }
