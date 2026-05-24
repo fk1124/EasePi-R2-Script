@@ -1534,21 +1534,34 @@ run_in_openwrt_container() {
     lxc-attach -P "$CONTAINER_DIR" -n "$name" -- /bin/sh "$@"
 }
 
-prepare_openwrt_lxc_plugin_runtime() {
-    local name pkg
+install_openwrt_lxc_passwall() {
+    local name
     select_openwrt_container
     name="$SELECTED_OPENWRT_CT"
 
     check_openwrt_kmods
 
     echo
-    echo "========== 准备 OpenWrt LXC 插件环境 =========="
+    echo "========== 一键安装 Passwall =========="
     run_in_openwrt_container "$name" -s <<'EOS'
 set -u
 
 ok() { echo "[OK] $*"; }
 warn() { echo "[WARN] $*" >&2; }
 installed() { opkg status "$1" 2>/dev/null | grep -q 'Status: install ok installed'; }
+fetch_file() {
+    local url="$1"
+    local dst="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL -o "$dst" "$url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -O "$dst" "$url"
+    elif command -v uclient-fetch >/dev/null 2>&1; then
+        uclient-fetch -O "$dst" "$url"
+    else
+        return 1
+    fi
+}
 
 [ -r /etc/openwrt_release ] || { warn "当前容器不像 OpenWrt。"; exit 1; }
 command -v opkg >/dev/null 2>&1 || { warn "未找到 opkg。"; exit 1; }
@@ -1559,6 +1572,26 @@ if opkg status kernel >/tmp/easepi-kernel-status 2>/dev/null; then
     echo "opkg kernel: $(awk '/^Version:/{print $2; exit}' /tmp/easepi-kernel-status)"
 fi
 rm -f /tmp/easepi-kernel-status
+
+mkdir -p /etc/opkg
+touch /etc/opkg/customfeeds.conf
+. /etc/openwrt_release
+release="${DISTRIB_RELEASE%.*}"
+arch="$DISTRIB_ARCH"
+
+echo
+echo "配置 Passwall-build 软件源：packages-${release}/${arch}"
+if fetch_file "https://master.dl.sourceforge.net/project/openwrt-passwall-build/ipk.pub" /tmp/easepi-passwall-ipk.pub; then
+    opkg-key add /tmp/easepi-passwall-ipk.pub >/dev/null 2>&1 || warn "Passwall-build key 导入失败，若软件源签名校验失败请手动检查。"
+    rm -f /tmp/easepi-passwall-ipk.pub
+else
+    warn "Passwall-build key 下载失败，继续尝试使用已有 key。"
+fi
+
+for feed in passwall_luci passwall_packages passwall2; do
+    sed -i -E "/^[[:space:]]*src\\/gz[[:space:]]+${feed}[[:space:]]+/d" /etc/opkg/customfeeds.conf
+    echo "src/gz ${feed} https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-${release}/${arch}/${feed}" >> /etc/opkg/customfeeds.conf
+done
 
 for conf in /etc/opkg/distfeeds.conf /etc/opkg/customfeeds.conf; do
     [ -f "$conf" ] || continue
@@ -1579,7 +1612,8 @@ else
         /etc/init.d/dnsmasq stop >/dev/null 2>&1 || true
         opkg remove dnsmasq --force-depends || warn "移除 dnsmasq 失败，稍后安装 dnsmasq-full 可能冲突。"
     fi
-    opkg install dnsmasq-full && ok "dnsmasq-full 已安装。" || warn "dnsmasq-full 安装失败。"
+    opkg install dnsmasq-full || opkg install --force-overwrite dnsmasq-full
+    installed dnsmasq-full && ok "dnsmasq-full 已安装。" || warn "dnsmasq-full 安装失败。"
     /etc/init.d/dnsmasq enable >/dev/null 2>&1 || true
     /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
 fi
@@ -1601,6 +1635,14 @@ else
 fi
 
 echo
+echo "安装 Passwall 与中文翻译包..."
+if opkg install --force-depends luci-app-passwall luci-i18n-passwall-zh-cn; then
+    ok "luci-app-passwall 与 luci-i18n-passwall-zh-cn 已安装。"
+else
+    warn "Passwall 安装命令返回失败。请查看上方 opkg 输出，通常是软件源网络或用户态依赖下载失败。"
+fi
+
+echo
 echo "宿主内核能力可见性："
 for m in nf_tables nft_tproxy nft_socket nf_tproxy_ipv4 nf_tproxy_ipv6 xt_TPROXY xt_socket nft_chain_nat nf_nat tun wireguard; do
     if grep -qw "$m" /proc/modules; then
@@ -1609,23 +1651,10 @@ for m in nf_tables nft_tproxy nft_socket nf_tproxy_ipv4 nf_tproxy_ipv6 xt_TPROXY
         echo "  [WARN] $m 未加载"
     fi
 done
-EOS
-
-    echo
-    if confirm "是否现在安装/修复 luci-app-passwall（会跳过 kmod 依赖检查）？" n; then
-        pkg="$(read_default "Passwall 包名" "luci-app-passwall")"
-        case "$pkg" in
-            ""|*[!A-Za-z0-9._+-]*) die "包名不合法：$pkg" ;;
-        esac
-        run_in_openwrt_container "$name" -s <<EOS
-set -u
-opkg update || true
-opkg install --force-depends "$pkg"
 /etc/init.d/rpcd restart >/dev/null 2>&1 || true
 /etc/init.d/uhttpd restart >/dev/null 2>&1 || true
-echo "[OK] $pkg 安装流程已执行。"
+echo "[OK] Passwall 一键安装流程已执行。"
 EOS
-    fi
 }
 
 backup_container() {
@@ -1714,7 +1743,7 @@ main_menu() {
         echo "8. 一键安装 Debian 13 Trixie"
         echo "9. 一键安装 Ubuntu 24.04 Noble"
         echo "10. LXC 备份 / 还原"
-        echo "11. OpenWrt LXC 插件/Passwall 准备"
+        echo "11. 一键安装 Passwall（LXC 兼容，含中文翻译）"
         echo "s. 查看当前状态"
         echo "0. 退出"
         read -r -p "请选择: " choice || exit 0
@@ -1729,7 +1758,7 @@ main_menu() {
             8) install_linux_container debian13; pause_enter ;;
             9) install_linux_container ubuntu24; pause_enter ;;
             10) backup_restore_menu ;;
-            11) prepare_openwrt_lxc_plugin_runtime; pause_enter ;;
+            11) install_openwrt_lxc_passwall; pause_enter ;;
             s|S) show_status; pause_enter ;;
             0) exit 0 ;;
             *) warn "无效选择。" ;;
