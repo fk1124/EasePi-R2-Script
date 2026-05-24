@@ -741,6 +741,123 @@ mount_lxc_to_ssd() {
     findmnt "$LXC_BASE" || true
 }
 
+persist_current_lxc_mount() {
+    local src uuid tmp
+    src="$(findmnt -rn "$LXC_BASE" -o SOURCE 2>/dev/null | head -n1 || true)"
+    [ -n "$src" ] || { warn "未检测到 $LXC_BASE 的挂载源，已跳过 fstab 修复。"; return 0; }
+    case "$src" in
+        /dev/*) ;;
+        *) warn "$LXC_BASE 当前挂载源是 $src，不是块设备，已跳过 fstab 修复。"; return 0 ;;
+    esac
+    uuid="$(blkid -s UUID -o value "$src" 2>/dev/null || true)"
+    [ -n "$uuid" ] || { warn "无法读取 $src 的 UUID，已跳过 fstab 修复。"; return 0; }
+
+    cp -a /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+    tmp="$(mktemp)"
+    grep -vE "[[:space:]]${LXC_BASE//\//\\/}[[:space:]]" /etc/fstab > "$tmp" 2>/dev/null || true
+    printf 'UUID=%s %s ext4 defaults,noatime 0 2\n' "$uuid" "$LXC_BASE" >> "$tmp"
+    install -m 0644 "$tmp" /etc/fstab
+    rm -f "$tmp"
+    ok "已修复 /etc/fstab：$src -> $LXC_BASE"
+}
+
+write_lxc_service_mount_dropin() {
+    mkdir -p /etc/systemd/system/lxc.service.d
+    cat > /etc/systemd/system/lxc.service.d/10-easepi-r2-lxcpath.conf <<EOF
+[Unit]
+RequiresMountsFor=${LXC_BASE} ${CONTAINER_DIR}
+After=local-fs.target
+EOF
+}
+
+infer_lxc_net_info() {
+    local cfg="$1"
+    awk '
+        function trim(s) {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+            return s
+        }
+        /^[[:space:]]*lxc\.net\.[0-9]+\.(type|link|name)[[:space:]]*=/ {
+            key = $1
+            val = $0
+            sub(/^[^=]*=/, "", val)
+            val = trim(val)
+            split(key, a, ".")
+            idx = a[3]
+            attr = a[4]
+            data[idx, attr] = val
+            seen[idx] = 1
+        }
+        END {
+            for (idx in seen) {
+                if (data[idx, "type"] == "phys" && data[idx, "link"] != "")
+                    print "phys " data[idx, "link"]
+                if (data[idx, "type"] == "veth" && data[idx, "name"] == "host0" && data[idx, "link"] != "")
+                    print "hostbr " data[idx, "link"]
+            }
+        }
+    ' "$cfg"
+}
+
+repair_hostnet_from_existing_openwrt() {
+    local name cfg kind value phys_ifs="" host_br=""
+    while read -r name; do
+        cfg="$(container_dir_for "$name")/config"
+        [ -r "$cfg" ] || continue
+        while read -r kind value; do
+            [ -n "${kind:-}" ] || continue
+            case "$kind" in
+                phys)
+                    if ! printf ' %s ' "$phys_ifs" | grep -q " ${value} "; then
+                        phys_ifs="$(trim "$phys_ifs $value")"
+                    fi
+                    ;;
+                hostbr)
+                    host_br="$value"
+                    ;;
+            esac
+        done < <(infer_lxc_net_info "$cfg")
+    done < <(container_names)
+
+    if [ -z "$phys_ifs" ] && [ -z "$host_br" ]; then
+        warn "未从现有容器配置中识别到 OpenWrt 路由容器的物理网口/宿主桥，已跳过 hostnet 修复。"
+        return 0
+    fi
+
+    PHYS_IFS="$phys_ifs"
+    [ -n "$host_br" ] && HOST_BR="$host_br"
+    write_hostnet_service
+    systemctl start easepi-r2-lxc-hostnet.service >/dev/null 2>&1 || warn "easepi-r2-lxc-hostnet.service 启动失败，请检查物理网口是否存在：$PHYS_IFS"
+    ok "已修复 OpenWrt LXC 宿主桥：${HOST_BR}；物理网口：${PHYS_IFS:-无}"
+}
+
+repair_lxc_remount() {
+    need_root
+    load_config
+
+    echo
+    echo "========== 重挂载修复已有 LXC 数据 =========="
+    if ! findmnt -rn "$LXC_BASE" >/dev/null 2>&1; then
+        warn "$LXC_BASE 当前不是挂载点。请先用“磁盘工具”把 M.2/SSD 挂载到 $LXC_BASE。"
+        return 1
+    fi
+
+    install_lxc_dependencies || return 1
+    ensure_dirs
+    persist_current_lxc_mount
+    write_lxc_service_mount_dropin
+    repair_hostnet_from_existing_openwrt
+    save_config
+    repair_all_container_autostart
+    write_all_container_shortcuts
+
+    systemctl daemon-reload || true
+    systemctl enable --now lxcfs.service >/dev/null 2>&1 || true
+    systemctl enable --now lxc.service >/dev/null 2>&1 || true
+    ok "LXC 重挂载修复完成。"
+    list_containers || true
+}
+
 lxc_dirs_menu() {
     local choice
     while true; do
@@ -749,12 +866,14 @@ lxc_dirs_menu() {
         echo "1. 查看当前目录"
         echo "2. 修改 LXC 根目录"
         echo "3. 磁盘工具：检测 M.2/SSD 并挂载到 LXC 根目录"
+        echo "4. 重挂载修复已有 LXC 数据"
         echo "0. 返回"
         read -r -p "请选择: " choice || return 0
         case "$choice" in
             1) show_lxc_dirs; pause_enter ;;
             2) set_lxc_dirs; pause_enter ;;
             3) mount_lxc_to_ssd; pause_enter ;;
+            4) repair_lxc_remount; pause_enter ;;
             0) return 0 ;;
             *) warn "无效选择。" ;;
         esac
@@ -1350,12 +1469,13 @@ container_running() {
 ensure_single_router_running() {
     local target="$1"
     local name
-    for name in openwrt openwrt24 openwrt25; do
+    while read -r name; do
+        [ -n "$name" ] || continue
         [ "$name" = "$target" ] && continue
-        if container_running "$name"; then
+        if container_is_openwrt_router "$name" && container_running "$name"; then
             die "检测到路由容器 $name 正在运行。OpenWrt 路由容器同一时间只建议运行一个，请先停止它。"
         fi
-    done
+    done < <(container_names)
 }
 
 prepare_container_dir() {
@@ -1493,6 +1613,283 @@ list_containers() {
     else
         find "$CONTAINER_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null || true
     fi
+}
+
+container_names() {
+    local dir
+    [ -d "$CONTAINER_DIR" ] || return 0
+    for dir in "$CONTAINER_DIR"/*; do
+        [ -d "$dir" ] || continue
+        [ -r "$dir/config" ] || continue
+        basename "$dir"
+    done | sort
+}
+
+valid_container_name() {
+    case "$1" in
+        ""|*/*|*[!A-Za-z0-9_.-]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+container_exists() {
+    local name="$1"
+    [ -d "$(container_dir_for "$name")" ] && [ -r "$(container_dir_for "$name")/config" ]
+}
+
+container_config_for() {
+    echo "$(container_dir_for "$1")/config"
+}
+
+container_is_openwrt_router() {
+    local name="$1" cfg
+    cfg="$(container_config_for "$name")"
+    case "$name" in openwrt|openwrt[0-9]*|openwrt-*) return 0 ;; esac
+    grep -Eq '^[[:space:]]*lxc\.net\.[0-9]+\.name[[:space:]]*=[[:space:]]*wan[[:space:]]*$' "$cfg" 2>/dev/null
+}
+
+set_lxc_config_key() {
+    local cfg="$1" key="$2" value="$3" tmp regex
+    [ -r "$cfg" ] || die "容器配置不存在：$cfg"
+    tmp="$(mktemp)"
+    regex="$(printf '%s' "$key" | sed 's/[.[\*^$()+?{}|]/\\&/g')"
+    grep -vE "^[[:space:]]*${regex}[[:space:]]*=" "$cfg" > "$tmp" || true
+    printf '%s = %s\n' "$key" "$value" >> "$tmp"
+    install -m 0644 "$tmp" "$cfg"
+    rm -f "$tmp"
+}
+
+set_container_autostart() {
+    local name="$1" enabled="$2" cfg order
+    container_exists "$name" || die "容器不存在：$name"
+    cfg="$(container_config_for "$name")"
+    if [ "$enabled" = "1" ]; then
+        if container_is_openwrt_router "$name"; then
+            order=10
+        else
+            order=50
+        fi
+        set_lxc_config_key "$cfg" "lxc.start.auto" "1"
+        set_lxc_config_key "$cfg" "lxc.start.order" "$order"
+        ok "已启用 $name 开机自启动。"
+    else
+        set_lxc_config_key "$cfg" "lxc.start.auto" "0"
+        ok "已取消 $name 开机自启动。"
+    fi
+}
+
+repair_all_container_autostart() {
+    local -a names routers
+    local name selected default choice idx
+    mapfile -t names < <(container_names)
+    [ "${#names[@]}" -gt 0 ] || { warn "没有发现容器。"; return 0; }
+
+    routers=()
+    for name in "${names[@]}"; do
+        if container_is_openwrt_router "$name"; then
+            routers+=("$name")
+        fi
+    done
+
+    selected=""
+    if [ "${#routers[@]}" -eq 1 ]; then
+        selected="${routers[0]}"
+    elif [ "${#routers[@]}" -gt 1 ]; then
+        echo
+        warn "检测到多个 OpenWrt 路由容器，同一时间只建议一个开机自启动。"
+        idx=1
+        for name in "${routers[@]}"; do
+            printf '  %d. %s\n' "$idx" "$name"
+            idx=$((idx + 1))
+        done
+        default=1
+        read -r -p "请选择默认开机自启动的 OpenWrt 容器，输入 0 表示都不自启 [$default]: " choice || choice="$default"
+        choice="${choice:-$default}"
+        if [ "$choice" != "0" ]; then
+            case "$choice" in
+                *[!0-9]*|"") warn "选择无效，已跳过 OpenWrt 自启修复。" ;;
+                *)
+                    if [ "$choice" -ge 1 ] && [ "$choice" -le "${#routers[@]}" ]; then
+                        selected="${routers[$((choice - 1))]}"
+                    else
+                        warn "选择超出范围，已跳过 OpenWrt 自启修复。"
+                    fi
+                    ;;
+            esac
+        fi
+    fi
+
+    for name in "${names[@]}"; do
+        if container_is_openwrt_router "$name"; then
+            if [ -n "$selected" ] && [ "$name" = "$selected" ]; then
+                set_container_autostart "$name" 1
+            else
+                set_container_autostart "$name" 0
+            fi
+        else
+            set_container_autostart "$name" 1
+        fi
+    done
+}
+
+ensure_lxc_hostnet_started_if_present() {
+    if systemctl list-unit-files easepi-r2-lxc-hostnet.service --no-legend 2>/dev/null | grep -q '^easepi-r2-lxc-hostnet\.service'; then
+        systemctl start easepi-r2-lxc-hostnet.service >/dev/null 2>&1 || warn "easepi-r2-lxc-hostnet.service 启动失败。"
+    fi
+}
+
+start_container_by_name() {
+    local name="$1" i
+    container_exists "$name" || die "容器不存在：$name"
+    if container_running "$name"; then
+        ok "$name 已在运行。"
+        return 0
+    fi
+    if container_is_openwrt_router "$name"; then
+        ensure_single_router_running "$name"
+    fi
+    ensure_lxc_hostnet_started_if_present
+    lxc-start -P "$CONTAINER_DIR" -n "$name" -d
+    for i in $(seq 1 10); do
+        container_running "$name" && { ok "$name 已启动。"; return 0; }
+        sleep 1
+    done
+    lxc-info -P "$CONTAINER_DIR" -n "$name" || true
+    die "$name 启动后未进入 RUNNING 状态。"
+}
+
+stop_container_by_name() {
+    local name="$1"
+    container_exists "$name" || die "容器不存在：$name"
+    if ! container_running "$name"; then
+        ok "$name 已停止。"
+        return 0
+    fi
+    lxc-stop -P "$CONTAINER_DIR" -n "$name"
+    ok "$name 已停止。"
+}
+
+restart_container_by_name() {
+    local name="$1"
+    container_exists "$name" || die "容器不存在：$name"
+    container_running "$name" && lxc-stop -P "$CONTAINER_DIR" -n "$name" || true
+    start_container_by_name "$name"
+}
+
+attach_container_by_name() {
+    local name="$1" shell
+    container_exists "$name" || die "容器不存在：$name"
+    start_container_by_name "$name"
+    for shell in /bin/bash /bin/ash /bin/sh; do
+        if lxc-attach -P "$CONTAINER_DIR" -n "$name" -- test -x "$shell" >/dev/null 2>&1; then
+            lxc-attach -P "$CONTAINER_DIR" -n "$name" -- "$shell"
+            return 0
+        fi
+    done
+    lxc-attach -P "$CONTAINER_DIR" -n "$name"
+}
+
+prompt_container_name() {
+    local prompt="$1" name
+    echo >&2
+    list_containers >&2 || true
+    read -r -p "$prompt: " name || name=""
+    valid_container_name "$name" || die "容器名称不合法：$name"
+    container_exists "$name" || die "容器不存在：$name"
+    echo "$name"
+}
+
+write_container_shortcut() {
+    local name="$1" target="/usr/local/bin/$1" is_router=0 router_names="" other
+    valid_container_name "$name" || { warn "跳过非法容器名：$name"; return 0; }
+    if [ -e "$target" ] && ! grep -qs 'EasePi-R2 LXC container shortcut' "$target"; then
+        warn "$target 已存在且不是本脚本生成，已跳过。"
+        return 0
+    fi
+    if container_is_openwrt_router "$name"; then
+        is_router=1
+        while read -r other; do
+            [ -n "$other" ] || continue
+            if container_is_openwrt_router "$other"; then
+                router_names="$(trim "$router_names $other")"
+            fi
+        done < <(container_names)
+    fi
+    cat > "$target" <<EOF
+#!/bin/sh
+# EasePi-R2 LXC container shortcut: ${name}
+set -eu
+
+CONFIG_FILE="/etc/easepi-r2-lxc-manager/config.env"
+[ -r "\$CONFIG_FILE" ] && . "\$CONFIG_FILE"
+CONTAINER_DIR="\${CONTAINER_DIR:-${CONTAINER_DIR}}"
+CT_NAME="${name}"
+CT_ROUTER="${is_router}"
+ROUTER_NAMES="${router_names}"
+
+running() {
+    lxc-info -P "\$CONTAINER_DIR" -n "\$CT_NAME" -s 2>/dev/null | grep -q RUNNING
+}
+
+router_guard() {
+    [ "\$CT_ROUTER" = "1" ] || return 0
+    for other in \$ROUTER_NAMES; do
+        [ "\$other" = "\$CT_NAME" ] && continue
+        if lxc-info -P "\$CONTAINER_DIR" -n "\$other" -s 2>/dev/null | grep -q RUNNING; then
+            echo "OpenWrt router container \$other is already running. Stop it before starting \$CT_NAME." >&2
+            exit 1
+        fi
+    done
+}
+
+start_ct() {
+    if running; then
+        return 0
+    fi
+    router_guard
+    if systemctl list-unit-files easepi-r2-lxc-hostnet.service --no-legend 2>/dev/null | grep -q '^easepi-r2-lxc-hostnet\.service'; then
+        systemctl start easepi-r2-lxc-hostnet.service >/dev/null 2>&1 || true
+    fi
+    lxc-start -P "\$CONTAINER_DIR" -n "\$CT_NAME" -d
+    i=0
+    while [ "\$i" -lt 10 ]; do
+        running && return 0
+        i=\$((i + 1))
+        sleep 1
+    done
+    lxc-info -P "\$CONTAINER_DIR" -n "\$CT_NAME" || true
+    exit 1
+}
+
+attach_ct() {
+    start_ct
+    for sh in /bin/bash /bin/ash /bin/sh; do
+        if lxc-attach -P "\$CONTAINER_DIR" -n "\$CT_NAME" -- test -x "\$sh" >/dev/null 2>&1; then
+            exec lxc-attach -P "\$CONTAINER_DIR" -n "\$CT_NAME" -- "\$sh"
+        fi
+    done
+    exec lxc-attach -P "\$CONTAINER_DIR" -n "\$CT_NAME"
+}
+
+case "\${1:-attach}" in
+    attach|shell|console|"") attach_ct ;;
+    start) start_ct ;;
+    stop) lxc-stop -P "\$CONTAINER_DIR" -n "\$CT_NAME" ;;
+    restart) lxc-stop -P "\$CONTAINER_DIR" -n "\$CT_NAME" 2>/dev/null || true; start_ct ;;
+    status) lxc-info -P "\$CONTAINER_DIR" -n "\$CT_NAME" ;;
+    *) start_ct; exec lxc-attach -P "\$CONTAINER_DIR" -n "\$CT_NAME" -- "\$@" ;;
+esac
+EOF
+    chmod 755 "$target"
+    ok "已生成快捷命令：$target"
+}
+
+write_all_container_shortcuts() {
+    local name
+    while read -r name; do
+        [ -n "$name" ] || continue
+        write_container_shortcut "$name"
+    done < <(container_names)
 }
 
 default_openwrt_container_name() {
@@ -1834,6 +2231,83 @@ backup_restore_menu() {
     done
 }
 
+container_manage_menu() {
+    local choice name
+    while true; do
+        echo
+        echo "========== LXC 容器管理 =========="
+        echo "1. 查看容器"
+        echo "2. 启动容器"
+        echo "3. 停止容器"
+        echo "4. 重启容器"
+        echo "5. 进入容器后台"
+        echo "6. 启用容器开机自启动"
+        echo "7. 取消容器开机自启动"
+        echo "8. 修复所有容器开机自启动"
+        echo "9. 生成容器快捷命令"
+        echo "0. 返回"
+        read -r -p "请选择: " choice || return 0
+        case "$choice" in
+            1)
+                list_containers
+                pause_enter
+                ;;
+            2)
+                name="$(prompt_container_name "请输入要启动的容器名称")"
+                start_container_by_name "$name"
+                pause_enter
+                ;;
+            3)
+                name="$(prompt_container_name "请输入要停止的容器名称")"
+                stop_container_by_name "$name"
+                pause_enter
+                ;;
+            4)
+                name="$(prompt_container_name "请输入要重启的容器名称")"
+                restart_container_by_name "$name"
+                pause_enter
+                ;;
+            5)
+                name="$(prompt_container_name "请输入要进入的容器名称")"
+                attach_container_by_name "$name"
+                ;;
+            6)
+                name="$(prompt_container_name "请输入要启用自启动的容器名称")"
+                if container_is_openwrt_router "$name"; then
+                    warn "OpenWrt 路由容器同一时间只建议一个开机自启动。"
+                    while read -r other; do
+                        [ "$other" = "$name" ] && continue
+                        if container_is_openwrt_router "$other"; then
+                            set_container_autostart "$other" 0
+                        fi
+                    done < <(container_names)
+                fi
+                set_container_autostart "$name" 1
+                pause_enter
+                ;;
+            7)
+                name="$(prompt_container_name "请输入要取消自启动的容器名称")"
+                set_container_autostart "$name" 0
+                pause_enter
+                ;;
+            8)
+                repair_all_container_autostart
+                pause_enter
+                ;;
+            9)
+                write_all_container_shortcuts
+                pause_enter
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                warn "无效选择。"
+                ;;
+        esac
+    done
+}
+
 show_status() {
     echo
     echo "========== 当前状态 =========="
@@ -1864,6 +2338,7 @@ main_menu() {
         echo "10. LXC 备份 / 还原"
         echo "11. 一键安装 Passwall（LXC 兼容，含中文翻译）"
         echo "12. 一键安装 EasyTier（LXC 兼容，含核心和中文翻译）"
+        echo "13. LXC 容器管理"
         echo "s. 查看当前状态"
         echo "0. 退出"
         read -r -p "请选择: " choice || exit 0
@@ -1880,6 +2355,7 @@ main_menu() {
             10) backup_restore_menu ;;
             11) install_openwrt_lxc_passwall; pause_enter ;;
             12) install_openwrt_lxc_easytier; pause_enter ;;
+            13) container_manage_menu ;;
             s|S) show_status; pause_enter ;;
             0) exit 0 ;;
             *) warn "无效选择。" ;;
