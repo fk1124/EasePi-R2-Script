@@ -832,7 +832,6 @@ repair_hostnet_from_existing_openwrt() {
 }
 
 repair_lxc_remount() {
-    need_root
     load_config
 
     echo
@@ -841,6 +840,10 @@ repair_lxc_remount() {
         warn "$LXC_BASE 当前不是挂载点。请先用“磁盘工具”把 M.2/SSD 挂载到 $LXC_BASE。"
         return 1
     fi
+
+    warn "此修复会重写 /etc/fstab 和 LXC 配置，并可能启动 hostnet、lxc.service 以及已设置自启动的容器。"
+    warn "如果 OpenWrt 路由容器接管了当前 SSH 所用物理网口，SSH 连接可能会断开；建议优先通过串口/HDMI 执行。"
+    confirm "确认继续执行重挂载修复" n || { warn "已取消。"; return 0; }
 
     install_lxc_dependencies || return 1
     ensure_dirs
