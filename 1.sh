@@ -800,6 +800,7 @@ infer_lxc_net_info() {
 }
 
 repair_hostnet_from_existing_openwrt() {
+    local start_now="${1:-0}"
     local name cfg kind value phys_ifs="" host_br=""
     while read -r name; do
         cfg="$(container_dir_for "$name")/config"
@@ -827,8 +828,21 @@ repair_hostnet_from_existing_openwrt() {
     PHYS_IFS="$phys_ifs"
     [ -n "$host_br" ] && HOST_BR="$host_br"
     write_hostnet_service
-    systemctl start easepi-r2-lxc-hostnet.service >/dev/null 2>&1 || warn "easepi-r2-lxc-hostnet.service 启动失败，请检查物理网口是否存在：$PHYS_IFS"
-    ok "已修复 OpenWrt LXC 宿主桥：${HOST_BR}；物理网口：${PHYS_IFS:-无}"
+    if [ "$start_now" = "1" ]; then
+        systemctl start easepi-r2-lxc-hostnet.service >/dev/null 2>&1 || warn "easepi-r2-lxc-hostnet.service 启动失败，请检查物理网口是否存在：$PHYS_IFS"
+        ok "已修复并启动 OpenWrt LXC 宿主桥：${HOST_BR}；物理网口：${PHYS_IFS:-无}"
+    else
+        ok "已修复 OpenWrt LXC 宿主桥服务：${HOST_BR}；物理网口：${PHYS_IFS:-无}（未立即切网启动）"
+    fi
+}
+
+start_lxc_autostart_now() {
+    warn "即将启动 hostnet 和 LXC 自启动容器；OpenWrt 路由容器可能接管物理网口，SSH 可能会断开。"
+    confirm "确认现在启动 hostnet 和 LXC 自启动容器" n || { warn "已跳过立即启动；重启后仍会按自启动配置启动。"; return 0; }
+    systemctl start easepi-r2-lxc-hostnet.service >/dev/null 2>&1 || warn "easepi-r2-lxc-hostnet.service 启动失败。"
+    systemctl restart lxc.service >/dev/null 2>&1 || warn "lxc.service 重启失败。"
+    ok "已触发 hostnet 和 LXC 自启动容器。"
+    list_containers || true
 }
 
 repair_lxc_remount() {
@@ -841,24 +855,25 @@ repair_lxc_remount() {
         return 1
     fi
 
-    warn "此修复会重写 /etc/fstab 和 LXC 配置，并可能启动 hostnet、lxc.service 以及已设置自启动的容器。"
-    warn "如果 OpenWrt 路由容器接管了当前 SSH 所用物理网口，SSH 连接可能会断开；建议优先通过串口/HDMI 执行。"
+    warn "此修复会重写 /etc/fstab、LXC 配置、自启动配置和容器快捷命令。"
+    warn "默认不会立即切网启动容器；最后如选择立即启动，SSH 才可能断开。"
     confirm "确认继续执行重挂载修复" n || { warn "已取消。"; return 0; }
 
     install_lxc_dependencies || return 1
     ensure_dirs
     persist_current_lxc_mount
     write_lxc_service_mount_dropin
-    repair_hostnet_from_existing_openwrt
+    repair_hostnet_from_existing_openwrt 0
     save_config
     repair_all_container_autostart
     write_all_container_shortcuts
 
     systemctl daemon-reload || true
-    systemctl enable --now lxcfs.service >/dev/null 2>&1 || true
-    systemctl enable --now lxc.service >/dev/null 2>&1 || true
-    ok "LXC 重挂载修复完成。"
+    systemctl enable lxcfs.service lxc.service >/dev/null 2>&1 || true
+    systemctl start lxcfs.service >/dev/null 2>&1 || true
+    ok "LXC 重挂载修复完成；已启用下次开机自启动，但本次未默认启动 LXC 容器。"
     list_containers || true
+    start_lxc_autostart_now
 }
 
 lxc_dirs_menu() {
