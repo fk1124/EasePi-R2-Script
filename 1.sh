@@ -25,6 +25,9 @@ HOST_IP="${HOST_IP:-10.10.0.2}"
 HOST_IP_CIDR="${HOST_IP_CIDR:-10.10.0.2/24}"
 OPENWRT_IP="${OPENWRT_IP:-10.10.0.1}"
 LAN_CIDR="${LAN_CIDR:-10.10.0.0/24}"
+HOST_OPENWRT_ROUTE_ENABLE="${HOST_OPENWRT_ROUTE_ENABLE:-auto}"
+HOST_OPENWRT_ROUTE_METRIC="${HOST_OPENWRT_ROUTE_METRIC:-300}"
+HOST_OPENWRT_ROUTE_CHECK_IP="${HOST_OPENWRT_ROUTE_CHECK_IP:-223.5.5.5}"
 DHCP_START_IP="${DHCP_START_IP:-10.10.0.100}"
 DHCP_END_IP="${DHCP_END_IP:-10.10.0.249}"
 CANDIDATE_IFS="${CANDIDATE_IFS:-eth0 eth1 eth2 eth3}"
@@ -100,6 +103,9 @@ load_config() {
     : "${HOST_IP_CIDR:=10.10.0.2/24}"
     : "${OPENWRT_IP:=10.10.0.1}"
     : "${LAN_CIDR:=10.10.0.0/24}"
+    : "${HOST_OPENWRT_ROUTE_ENABLE:=auto}"
+    : "${HOST_OPENWRT_ROUTE_METRIC:=300}"
+    : "${HOST_OPENWRT_ROUTE_CHECK_IP:=223.5.5.5}"
     : "${DHCP_START_IP:=10.10.0.100}"
     : "${DHCP_END_IP:=10.10.0.249}"
 }
@@ -116,6 +122,9 @@ save_config() {
         printf 'HOST_IP_CIDR=%q\n' "$HOST_IP_CIDR"
         printf 'OPENWRT_IP=%q\n' "$OPENWRT_IP"
         printf 'LAN_CIDR=%q\n' "$LAN_CIDR"
+        printf 'HOST_OPENWRT_ROUTE_ENABLE=%q\n' "$HOST_OPENWRT_ROUTE_ENABLE"
+        printf 'HOST_OPENWRT_ROUTE_METRIC=%q\n' "$HOST_OPENWRT_ROUTE_METRIC"
+        printf 'HOST_OPENWRT_ROUTE_CHECK_IP=%q\n' "$HOST_OPENWRT_ROUTE_CHECK_IP"
         printf 'DHCP_START_IP=%q\n' "$DHCP_START_IP"
         printf 'DHCP_END_IP=%q\n' "$DHCP_END_IP"
     } > "$CONFIG_FILE"
@@ -902,6 +911,7 @@ repair_hostnet_from_existing_openwrt() {
     PHYS_IFS="$phys_ifs"
     [ -n "$host_br" ] && HOST_BR="$host_br"
     write_hostnet_service
+    write_hostroute_service
     if [ "$start_now" = "1" ]; then
         systemctl start easepi-r2-lxc-hostnet.service >/dev/null 2>&1 || warn "easepi-r2-lxc-hostnet.service 启动失败，请检查物理网口是否存在：$PHYS_IFS"
         ok "已修复并启动 OpenWrt LXC 宿主桥：${HOST_BR}；物理网口：${PHYS_IFS:-无}"
@@ -915,6 +925,8 @@ start_lxc_autostart_now() {
     confirm "确认现在启动 hostnet 和 LXC 自启动容器" n || { warn "已跳过立即启动；重启后仍会按自启动配置启动。"; return 0; }
     systemctl start easepi-r2-lxc-hostnet.service >/dev/null 2>&1 || warn "easepi-r2-lxc-hostnet.service 启动失败。"
     systemctl restart lxc.service >/dev/null 2>&1 || warn "lxc.service 重启失败。"
+    systemctl start easepi-r2-lxc-hostroute.timer >/dev/null 2>&1 || true
+    systemctl start easepi-r2-lxc-hostroute.service >/dev/null 2>&1 || true
     ok "已触发 hostnet 和 LXC 自启动容器。"
     list_containers || true
 }
@@ -1201,6 +1213,135 @@ After=easepi-r2-lxc-hostnet.service
 EOF
     systemctl daemon-reload
     systemctl enable easepi-r2-lxc-hostnet.service >/dev/null 2>&1 || true
+}
+
+write_hostroute_service() {
+    cat > /usr/local/sbin/easepi-r2-lxc-hostroute.sh <<EOF
+#!/bin/sh
+set -eu
+
+HOST_BR="${HOST_BR}"
+OPENWRT_IP="${OPENWRT_IP}"
+ROUTE_ENABLE="${HOST_OPENWRT_ROUTE_ENABLE}"
+ROUTE_METRIC="${HOST_OPENWRT_ROUTE_METRIC}"
+CHECK_IP="${HOST_OPENWRT_ROUTE_CHECK_IP}"
+
+log() { echo "[easepi-r2-lxc-hostroute] \$*"; }
+
+remove_openwrt_default() {
+    ip route del default via "\$OPENWRT_IP" dev "\$HOST_BR" 2>/dev/null || true
+}
+
+remove_openwrt_dns() {
+    if [ -f /etc/systemd/resolved.conf.d/easepi-r2-openwrt.conf ]; then
+        rm -f /etc/systemd/resolved.conf.d/easepi-r2-openwrt.conf
+        systemctl restart systemd-resolved.service >/dev/null 2>&1 || true
+    elif [ ! -L /etc/resolv.conf ] && grep -q "nameserver[[:space:]]\+\$OPENWRT_IP" /etc/resolv.conf 2>/dev/null; then
+        cat > /etc/resolv.conf <<DNS
+nameserver 223.5.5.5
+nameserver 119.29.29.29
+DNS
+    fi
+}
+
+case "\$ROUTE_ENABLE" in
+    0|off|OFF|no|NO|false|FALSE|disabled|DISABLED)
+        log "OpenWrt preferred host route disabled; remove managed route."
+        remove_openwrt_default
+        remove_openwrt_dns
+        exit 0
+        ;;
+esac
+
+case "\$ROUTE_METRIC" in
+    ""|*[!0-9]*) ROUTE_METRIC=300 ;;
+esac
+
+case "\$CHECK_IP" in
+    ""|*[!0-9.]*) CHECK_IP="" ;;
+esac
+
+if ! ip link show "\$HOST_BR" >/dev/null 2>&1; then
+    log "bridge \$HOST_BR is missing; keep existing fallback routes."
+    remove_openwrt_default
+    remove_openwrt_dns
+    exit 0
+fi
+
+ip link set "\$HOST_BR" up 2>/dev/null || true
+
+if ! ping -c 1 -W 1 "\$OPENWRT_IP" >/dev/null 2>&1; then
+    log "OpenWrt gateway \$OPENWRT_IP is unreachable; fall back to other default route."
+    remove_openwrt_default
+    remove_openwrt_dns
+    exit 0
+fi
+
+if [ -n "\$CHECK_IP" ]; then
+    ip route replace "\$CHECK_IP/32" via "\$OPENWRT_IP" dev "\$HOST_BR" metric "\$ROUTE_METRIC" 2>/dev/null || true
+    if ! ping -c 1 -W 2 "\$CHECK_IP" >/dev/null 2>&1; then
+        log "OpenWrt gateway is reachable, but internet check \$CHECK_IP failed; fall back to other default route."
+        ip route del "\$CHECK_IP/32" via "\$OPENWRT_IP" dev "\$HOST_BR" 2>/dev/null || true
+        remove_openwrt_default
+        remove_openwrt_dns
+        exit 0
+    fi
+    ip route del "\$CHECK_IP/32" via "\$OPENWRT_IP" dev "\$HOST_BR" 2>/dev/null || true
+fi
+
+ip route replace default via "\$OPENWRT_IP" dev "\$HOST_BR" metric "\$ROUTE_METRIC"
+
+if systemctl list-unit-files systemd-resolved.service --no-legend 2>/dev/null | grep -q '^systemd-resolved\.service'; then
+    mkdir -p /etc/systemd/resolved.conf.d
+    cat > /etc/systemd/resolved.conf.d/easepi-r2-openwrt.conf <<DNS
+[Resolve]
+DNS=\$OPENWRT_IP
+FallbackDNS=223.5.5.5 119.29.29.29
+DNSDefaultRoute=yes
+DNS
+    systemctl restart systemd-resolved.service >/dev/null 2>&1 || true
+elif [ ! -L /etc/resolv.conf ]; then
+    cat > /etc/resolv.conf <<DNS
+nameserver \$OPENWRT_IP
+nameserver 223.5.5.5
+nameserver 119.29.29.29
+DNS
+fi
+
+log "default route prefers OpenWrt: via \$OPENWRT_IP dev \$HOST_BR metric \$ROUTE_METRIC."
+EOF
+    chmod +x /usr/local/sbin/easepi-r2-lxc-hostroute.sh
+
+    cat > /etc/systemd/system/easepi-r2-lxc-hostroute.service <<'EOF'
+[Unit]
+Description=Prefer OpenWrt LXC as EasePi-R2 host default route when healthy
+After=easepi-r2-lxc-hostnet.service lxc.service
+Wants=easepi-r2-lxc-hostnet.service lxc.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/easepi-r2-lxc-hostroute.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat > /etc/systemd/system/easepi-r2-lxc-hostroute.timer <<'EOF'
+[Unit]
+Description=Re-check EasePi-R2 OpenWrt preferred host default route
+
+[Timer]
+OnBootSec=30sec
+OnUnitActiveSec=60sec
+AccuracySec=10sec
+Unit=easepi-r2-lxc-hostroute.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable easepi-r2-lxc-hostroute.timer >/dev/null 2>&1 || true
 }
 
 write_openwrt_lxc_config() {
@@ -1490,6 +1631,7 @@ exec >>"\$LOG" 2>&1
 printf '===== OpenWrt LXC finalize start: %s =====\n' "\$(date '+%F %T')"
 
 systemctl restart easepi-r2-lxc-hostnet.service
+systemctl start easepi-r2-lxc-hostroute.timer >/dev/null 2>&1 || true
 
 if lxc-info -P "\$CONTAINER_DIR" -n "\$CT_NAME" -s 2>/dev/null | grep -q RUNNING; then
     echo "OpenWrt container already running."
@@ -1534,13 +1676,7 @@ else
     echo "WARNING: OpenWrt cannot ping 223.5.5.5 yet."
 fi
 
-ip route replace default via "\$OPENWRT_IP" dev "\$HOST_BR" metric 300 2>/dev/null || true
-rm -f /etc/resolv.conf
-cat > /etc/resolv.conf <<DNS
-nameserver \$OPENWRT_IP
-nameserver 223.5.5.5
-nameserver 119.29.29.29
-DNS
+/usr/local/sbin/easepi-r2-lxc-hostroute.sh || true
 
 curl -m 5 -sS -I "http://\$OPENWRT_IP/" 2>&1 | sed -n '1,8p' || true
 lxc-info -P "\$CONTAINER_DIR" -n "\$CT_NAME" || true
@@ -1617,6 +1753,7 @@ install_openwrt_router() {
     tar --numeric-owner -xzf "$rootfs_file" -C "${dir}/rootfs"
 
     write_hostnet_service
+    write_hostroute_service
     write_openwrt_lxc_config "$name" "${dir}/rootfs" "$dir"
     configure_openwrt_rootfs "${dir}/rootfs"
     write_openwrt_finalizer "$name"
@@ -1830,11 +1967,21 @@ ensure_lxc_hostnet_started_if_present() {
     fi
 }
 
+start_lxc_hostroute_if_present() {
+    if systemctl list-unit-files easepi-r2-lxc-hostroute.service --no-legend 2>/dev/null | grep -q '^easepi-r2-lxc-hostroute\.service'; then
+        systemctl start easepi-r2-lxc-hostroute.timer >/dev/null 2>&1 || true
+        systemctl start easepi-r2-lxc-hostroute.service >/dev/null 2>&1 || true
+    fi
+}
+
 start_container_by_name() {
     local name="$1" i
     container_exists "$name" || die "容器不存在：$name"
     if container_running "$name"; then
         ok "$name 已在运行。"
+        if container_is_openwrt_router "$name"; then
+            start_lxc_hostroute_if_present
+        fi
         return 0
     fi
     if container_is_openwrt_router "$name"; then
@@ -1843,7 +1990,13 @@ start_container_by_name() {
     ensure_lxc_hostnet_started_if_present
     lxc-start -P "$CONTAINER_DIR" -n "$name" -d
     for i in $(seq 1 10); do
-        container_running "$name" && { ok "$name 已启动。"; return 0; }
+        if container_running "$name"; then
+            ok "$name 已启动。"
+            if container_is_openwrt_router "$name"; then
+                start_lxc_hostroute_if_present
+            fi
+            return 0
+        fi
         sleep 1
     done
     lxc-info -P "$CONTAINER_DIR" -n "$name" || true
@@ -1858,6 +2011,9 @@ stop_container_by_name() {
         return 0
     fi
     lxc-stop -P "$CONTAINER_DIR" -n "$name"
+    if container_is_openwrt_router "$name"; then
+        start_lxc_hostroute_if_present
+    fi
     ok "$name 已停止。"
 }
 
@@ -1936,6 +2092,10 @@ router_guard() {
 
 start_ct() {
     if running; then
+        if [ "\$CT_ROUTER" = "1" ] && systemctl list-unit-files easepi-r2-lxc-hostroute.service --no-legend 2>/dev/null | grep -q '^easepi-r2-lxc-hostroute\.service'; then
+            systemctl start easepi-r2-lxc-hostroute.timer >/dev/null 2>&1 || true
+            systemctl start easepi-r2-lxc-hostroute.service >/dev/null 2>&1 || true
+        fi
         return 0
     fi
     router_guard
@@ -1945,7 +2105,13 @@ start_ct() {
     lxc-start -P "\$CONTAINER_DIR" -n "\$CT_NAME" -d
     i=0
     while [ "\$i" -lt 10 ]; do
-        running && return 0
+        if running; then
+            if [ "\$CT_ROUTER" = "1" ] && systemctl list-unit-files easepi-r2-lxc-hostroute.service --no-legend 2>/dev/null | grep -q '^easepi-r2-lxc-hostroute\.service'; then
+                systemctl start easepi-r2-lxc-hostroute.timer >/dev/null 2>&1 || true
+                systemctl start easepi-r2-lxc-hostroute.service >/dev/null 2>&1 || true
+            fi
+            return 0
+        fi
         i=\$((i + 1))
         sleep 1
     done
@@ -1966,7 +2132,12 @@ attach_ct() {
 case "\${1:-attach}" in
     attach|shell|console|"") attach_ct ;;
     start) start_ct ;;
-    stop) lxc-stop -P "\$CONTAINER_DIR" -n "\$CT_NAME" ;;
+    stop)
+        lxc-stop -P "\$CONTAINER_DIR" -n "\$CT_NAME"
+        if [ "\$CT_ROUTER" = "1" ] && systemctl list-unit-files easepi-r2-lxc-hostroute.service --no-legend 2>/dev/null | grep -q '^easepi-r2-lxc-hostroute\.service'; then
+            systemctl start easepi-r2-lxc-hostroute.service >/dev/null 2>&1 || true
+        fi
+        ;;
     restart) lxc-stop -P "\$CONTAINER_DIR" -n "\$CT_NAME" 2>/dev/null || true; start_ct ;;
     status) lxc-info -P "\$CONTAINER_DIR" -n "\$CT_NAME" ;;
     *) start_ct; exec lxc-attach -P "\$CONTAINER_DIR" -n "\$CT_NAME" -- "\$@" ;;
@@ -2410,6 +2581,17 @@ show_status() {
     echo
     echo "网络："
     ip -br addr show "$HOST_BR" 2>/dev/null || true
+    echo
+    echo "默认路由："
+    ip route show default 2>/dev/null || true
+    echo
+    echo "出口判断："
+    ip route get "${HOST_OPENWRT_ROUTE_CHECK_IP:-223.5.5.5}" 2>/dev/null || true
+    if ping -c 1 -W 1 "$OPENWRT_IP" >/dev/null 2>&1; then
+        ok "OpenWrt 网关 ${OPENWRT_IP} 可达。"
+    else
+        warn "OpenWrt 网关 ${OPENWRT_IP} 不可达，宿主会保留其他默认路由兜底。"
+    fi
 }
 
 main_menu() {
