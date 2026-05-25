@@ -35,6 +35,8 @@ OPENWRT24_URL="${OPENWRT24_URL:-https://mirror.sjtu.edu.cn/openwrt/releases/24.1
 OPENWRT24_SHA256="${OPENWRT24_SHA256:-a0f7bdda2fe581e044b06d2f48788b76cbdb37cfa1e974d72ea981e391e04392}"
 OPENWRT25_URL="${OPENWRT25_URL:-https://downloads.openwrt.org/releases/25.12.0/targets/armsr/armv8/openwrt-25.12.0-armsr-armv8-rootfs.tar.gz}"
 OPENWRT25_SHA256="${OPENWRT25_SHA256:-d5e42b396d7f64697c65a884912107b49e05d2b2f2c00a251f94c44f8deef507}"
+UBUNTU_KEYRING_DEB="${UBUNTU_KEYRING_DEB:-ubuntu-keyring_2023.11.28.1_all.deb}"
+UBUNTU_KEYRING_SHA256="${UBUNTU_KEYRING_SHA256:-36de43b15853ccae0028e9a767613770c704833f82586f28eb262f0311adb8a8}"
 
 if [ "$(id -u)" != "0" ]; then
     echo "请用 root 执行：bash 1.sh"
@@ -326,12 +328,12 @@ download_file() {
     rm -f "$tmp"
     log "下载：$url"
     if command_exists curl; then
-        curl -L --fail --connect-timeout 20 --retry 3 -o "$tmp" "$url"
+        curl -L --fail --connect-timeout 20 --retry 3 -o "$tmp" "$url" || { rm -f "$tmp"; return 1; }
     else
-        wget -O "$tmp" "$url"
+        wget -O "$tmp" "$url" || { rm -f "$tmp"; return 1; }
     fi
     if [ -n "$sha" ]; then
-        echo "${sha}  ${tmp}" | sha256sum -c -
+        echo "${sha}  ${tmp}" | sha256sum -c - || { rm -f "$tmp"; return 1; }
     fi
     mv -f "$tmp" "$file"
     ok "下载完成：$file"
@@ -342,13 +344,79 @@ ensure_openwrt_rootfs() {
     download_file "$(rootfs_url "$key")" "$(rootfs_cache_file "$key")" "$(rootfs_sha256 "$key")"
 }
 
+ubuntu_keyring_url_candidates() {
+    local mirror_base
+    mirror_base="${UBUNTU_MIRROR%/}"
+    cat <<EOF
+${mirror_base}/pool/main/u/ubuntu-keyring/${UBUNTU_KEYRING_DEB}
+https://ports.ubuntu.com/ubuntu-ports/pool/main/u/ubuntu-keyring/${UBUNTU_KEYRING_DEB}
+https://archive.ubuntu.com/ubuntu/pool/main/u/ubuntu-keyring/${UBUNTU_KEYRING_DEB}
+EOF
+}
+
+ensure_ubuntu_archive_keyring() {
+    local keyring="${ROOTFS_CACHE_DIR}/ubuntu-archive-keyring.gpg"
+    local deb="${ROOTFS_CACHE_DIR}/${UBUNTU_KEYRING_DEB}"
+    local extract_dir url
+
+    if [ -s "$keyring" ]; then
+        echo "$keyring"
+        return 0
+    fi
+
+    mkdir -p "$ROOTFS_CACHE_DIR"
+    while IFS= read -r url; do
+        [ -n "$url" ] || continue
+        if download_file "$url" "$deb" "$UBUNTU_KEYRING_SHA256" >&2; then
+            break
+        fi
+        warn "下载 Ubuntu keyring 失败，尝试下一个源：$url"
+    done < <(ubuntu_keyring_url_candidates)
+
+    if ! sha256_file_ok "$deb" "$UBUNTU_KEYRING_SHA256"; then
+        die "无法下载并校验 Ubuntu keyring：${UBUNTU_KEYRING_DEB}"
+    fi
+
+    extract_dir="$(mktemp -d /tmp/easepi-r2-ubuntu-keyring.XXXXXX)"
+    dpkg-deb -x "$deb" "$extract_dir"
+    if [ ! -s "${extract_dir}/usr/share/keyrings/ubuntu-archive-keyring.gpg" ]; then
+        rm -rf "$extract_dir"
+        die "Ubuntu keyring 包内缺少 ubuntu-archive-keyring.gpg"
+    fi
+    install -m 0644 "${extract_dir}/usr/share/keyrings/ubuntu-archive-keyring.gpg" "$keyring"
+    rm -rf "$extract_dir"
+    echo "$keyring"
+}
+
+prepare_debootstrap_dir_for_suite() {
+    local suite="$1"
+    local compat_suite="${2:-}"
+    local source_dir="/usr/share/debootstrap"
+    local target_dir script_path
+
+    if [ -e "${source_dir}/scripts/${suite}" ]; then
+        echo "$source_dir"
+        return 0
+    fi
+    [ -n "$compat_suite" ] || die "当前 debootstrap 缺少 ${suite} 脚本。"
+    [ -e "${source_dir}/scripts/${compat_suite}" ] || die "当前 debootstrap 同时缺少 ${suite}/${compat_suite} 脚本。"
+
+    target_dir="$(mktemp -d /tmp/easepi-r2-debootstrap.XXXXXX)"
+    mkdir -p "${target_dir}/scripts"
+    cp -a "${source_dir}/functions" "${target_dir}/functions"
+    cp -a "${source_dir}/scripts/." "${target_dir}/scripts/"
+    script_path="${target_dir}/scripts/${suite}"
+    ln -s "$compat_suite" "$script_path" 2>/dev/null || cp -a "${target_dir}/scripts/${compat_suite}" "$script_path"
+    echo "$target_dir"
+}
+
 debootstrap_rootfs() {
     local key="$1"
     local suite="$2"
     local mirror="$3"
     local include="$4"
     local cache_file
-    local work rootfs keyring_arg
+    local work rootfs keyring_arg debootstrap_dir debootstrap_env
     cache_file="$(rootfs_cache_file "$key")"
 
     if [ -f "$cache_file" ]; then
@@ -363,21 +431,27 @@ debootstrap_rootfs() {
     mkdir -p "$rootfs"
 
     keyring_arg=()
+    debootstrap_dir="/usr/share/debootstrap"
     if [[ "$key" == ubuntu* ]]; then
-        if [ ! -f /usr/share/keyrings/ubuntu-archive-keyring.gpg ]; then
-            DEBIAN_FRONTEND=noninteractive apt-get install -y ubuntu-keyring >/dev/null 2>&1 || true
-        fi
-        if [ -f /usr/share/keyrings/ubuntu-archive-keyring.gpg ]; then
-            keyring_arg=(--keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg)
-        fi
+        keyring_arg=(--keyring="$(ensure_ubuntu_archive_keyring)")
+        debootstrap_dir="$(prepare_debootstrap_dir_for_suite "$suite" jammy)"
     fi
 
     log "生成 $(rootfs_label "$key")，时间会稍长..."
-    debootstrap --arch=arm64 --variant=minbase "${keyring_arg[@]}" --include="$include" "$suite" "$rootfs" "$mirror"
+    debootstrap_env=()
+    if [ "$debootstrap_dir" != "/usr/share/debootstrap" ]; then
+        debootstrap_env=(env "DEBOOTSTRAP_DIR=${debootstrap_dir}")
+    fi
+    if ! "${debootstrap_env[@]}" debootstrap --arch=arm64 --variant=minbase "${keyring_arg[@]}" --include="$include" "$suite" "$rootfs" "$mirror"; then
+        [ "$debootstrap_dir" = "/usr/share/debootstrap" ] || rm -rf "$debootstrap_dir"
+        rm -rf "$work"
+        return 1
+    fi
 
     configure_linux_rootfs_base "$rootfs" "$key"
 
     tar --numeric-owner --xattrs -C "$rootfs" -I 'zstd -19 -T0' -cpf "$cache_file" .
+    [ "$debootstrap_dir" = "/usr/share/debootstrap" ] || rm -rf "$debootstrap_dir"
     rm -rf "$work"
     ok "rootfs 已生成：$cache_file"
 }
