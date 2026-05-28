@@ -19,7 +19,8 @@ LXC_BASE="${LXC_BASE:-/lxc}"
 CONTAINER_DIR="${CONTAINER_DIR:-${LXC_BASE}/containers}"
 ROOTFS_CACHE_DIR="${ROOTFS_CACHE_DIR:-${LXC_BASE}/rootfs-cache}"
 BACKUP_DIR="${BACKUP_DIR:-${LXC_BASE}/backups}"
-BACKUP_REMOTE_REPO="${BACKUP_REMOTE_REPO:-https://github.com/fk1124/EasePi-R2-Image-Backup.git}"
+BACKUP_REMOTE_SLUG="${BACKUP_REMOTE_SLUG:-}"
+BACKUP_REMOTE_REPO="${BACKUP_REMOTE_REPO:-}"
 BACKUP_REMOTE_BRANCH="${BACKUP_REMOTE_BRANCH:-main}"
 BACKUP_REMOTE_PATH="${BACKUP_REMOTE_PATH:-backups}"
 BACKUP_CLOUD_DIR="${BACKUP_CLOUD_DIR:-${BACKUP_DIR}/.cloud-repo}"
@@ -136,6 +137,48 @@ valid_relative_path() {
     esac
 }
 
+normalize_backup_remote_slug() {
+    local input="$1"
+    input="$(trim "$input")"
+    input="${input#https://github.com/}"
+    input="${input#http://github.com/}"
+    input="${input#git@github.com:}"
+    input="${input#ssh://git@github.com/}"
+    input="${input%.git}"
+    input="${input#/}"
+    input="${input%/}"
+    printf '%s' "$input"
+}
+
+valid_backup_remote_slug() {
+    case "$1" in
+        */*)
+            case "$1" in
+                *//*|/*|*/|*../*|../*|*"/.."|*[!A-Za-z0-9_.\/-]*) return 1 ;;
+                *) [ "$(printf '%s' "$1" | awk -F/ '{print NF}')" -eq 2 ] ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+backup_remote_url_for_auth() {
+    local slug="$1" auth="$2"
+    case "$auth" in
+        ssh) printf 'git@github.com:%s.git' "$slug" ;;
+        *) printf 'https://github.com/%s.git' "$slug" ;;
+    esac
+}
+
+refresh_backup_remote_repo() {
+    BACKUP_REMOTE_SLUG="$(normalize_backup_remote_slug "${BACKUP_REMOTE_SLUG:-${BACKUP_REMOTE_REPO:-fk1124/EasePi-R2-Image-Backup}}")"
+    if ! valid_backup_remote_slug "$BACKUP_REMOTE_SLUG"; then
+        warn "云端仓库格式不合法，已恢复为 fk1124/EasePi-R2-Image-Backup。"
+        BACKUP_REMOTE_SLUG="fk1124/EasePi-R2-Image-Backup"
+    fi
+    BACKUP_REMOTE_REPO="$(backup_remote_url_for_auth "$BACKUP_REMOTE_SLUG" "$BACKUP_REMOTE_AUTH")"
+}
+
 valid_backup_filename() {
     case "$1" in
         ""|*/*|*.partial|*[!A-Za-z0-9_.-]*) return 1 ;;
@@ -169,7 +212,8 @@ load_config() {
     : "${CONTAINER_DIR:=${LXC_BASE}/containers}"
     : "${ROOTFS_CACHE_DIR:=${LXC_BASE}/rootfs-cache}"
     : "${BACKUP_DIR:=${LXC_BASE}/backups}"
-    : "${BACKUP_REMOTE_REPO:=https://github.com/fk1124/EasePi-R2-Image-Backup.git}"
+    : "${BACKUP_REMOTE_SLUG:=${BACKUP_REMOTE_REPO:-fk1124/EasePi-R2-Image-Backup}}"
+    : "${BACKUP_REMOTE_REPO:=}"
     : "${BACKUP_REMOTE_BRANCH:=main}"
     : "${BACKUP_REMOTE_PATH:=backups}"
     : "${BACKUP_CLOUD_DIR:=${BACKUP_DIR}/.cloud-repo}"
@@ -178,6 +222,7 @@ load_config() {
     : "${BACKUP_REMOTE_USER:=fk1124}"
     : "${BACKUP_REMOTE_TOKEN_FILE:=${CONFIG_DIR}/github-token}"
     : "${BACKUP_REMOTE_SSH_KEY:=/root/.ssh/easepi_r2_image_backup}"
+    refresh_backup_remote_repo
     : "${HOST_BR:=br-hostlan}"
     : "${HOST_IP:=10.10.0.2}"
     : "${HOST_IP_CIDR:=10.10.0.2/24}"
@@ -197,6 +242,7 @@ save_config() {
         printf 'CONTAINER_DIR=%q\n' "$CONTAINER_DIR"
         printf 'ROOTFS_CACHE_DIR=%q\n' "$ROOTFS_CACHE_DIR"
         printf 'BACKUP_DIR=%q\n' "$BACKUP_DIR"
+        printf 'BACKUP_REMOTE_SLUG=%q\n' "$BACKUP_REMOTE_SLUG"
         printf 'BACKUP_REMOTE_REPO=%q\n' "$BACKUP_REMOTE_REPO"
         printf 'BACKUP_REMOTE_BRANCH=%q\n' "$BACKUP_REMOTE_BRANCH"
         printf 'BACKUP_REMOTE_PATH=%q\n' "$BACKUP_REMOTE_PATH"
@@ -2830,8 +2876,35 @@ EOF
     echo "$askpass"
 }
 
+backup_cloud_auth_ready() {
+    refresh_backup_remote_repo
+    case "$BACKUP_REMOTE_AUTH" in
+        https-token)
+            if [ ! -r "$BACKUP_REMOTE_TOKEN_FILE" ]; then
+                warn "尚未配置 GitHub Token。请先进入“云端仓库备份设置 / 鉴权设置”。"
+                return 1
+            fi
+            ;;
+        ssh)
+            if [ ! -r "$BACKUP_REMOTE_SSH_KEY" ]; then
+                warn "尚未配置 SSH 私钥：$BACKUP_REMOTE_SSH_KEY"
+                warn "请先进入“云端仓库备份设置 / 鉴权设置”生成或配置 SSH Key。"
+                return 1
+            fi
+            ;;
+        none)
+            ;;
+        *)
+            warn "未知云端鉴权方式：$BACKUP_REMOTE_AUTH"
+            warn "请先进入“云端仓库备份设置 / 鉴权设置”重新选择鉴权方式。"
+            return 1
+            ;;
+    esac
+}
+
 run_backup_git() {
     local askpass rc
+    refresh_backup_remote_repo
     case "$BACKUP_REMOTE_AUTH" in
         https-token)
             [ -r "$BACKUP_REMOTE_TOKEN_FILE" ] || {
@@ -2875,6 +2948,7 @@ run_backup_git() {
 }
 
 ensure_backup_cloud_repo() {
+    backup_cloud_auth_ready || return 1
     mkdir -p "$(dirname "$BACKUP_CLOUD_DIR")"
     if [ ! -d "$BACKUP_CLOUD_DIR/.git" ]; then
         if [ -e "$BACKUP_CLOUD_DIR" ] && dir_has_entries "$BACKUP_CLOUD_DIR"; then
@@ -3009,10 +3083,12 @@ backup_cloud_commit_push() {
 }
 
 backup_cloud_settings() {
-    local repo branch remote_path cache_dir split_size auth_choice token key_pub
+    local repo_slug branch remote_path cache_dir split_size auth_choice token key_pub
+    refresh_backup_remote_repo
     echo
     echo "========== 云端仓库备份设置 =========="
-    echo "当前仓库      ：$BACKUP_REMOTE_REPO"
+    echo "当前仓库      ：$BACKUP_REMOTE_SLUG"
+    echo "Git 地址      ：$BACKUP_REMOTE_REPO"
     echo "当前分支      ：$BACKUP_REMOTE_BRANCH"
     echo "云端目录      ：$BACKUP_REMOTE_PATH"
     echo "本地缓存      ：$BACKUP_CLOUD_DIR"
@@ -3020,7 +3096,7 @@ backup_cloud_settings() {
     echo "鉴权方式      ：$BACKUP_REMOTE_AUTH"
     echo
 
-    repo="$(read_default "云端 git 仓库" "$BACKUP_REMOTE_REPO")"
+    repo_slug="$(read_default "云端 GitHub 仓库（owner/repo）" "$BACKUP_REMOTE_SLUG")"
     branch="$(read_default "云端分支" "$BACKUP_REMOTE_BRANCH")"
     remote_path="$(read_default "云端备份目录" "$BACKUP_REMOTE_PATH")"
     cache_dir="$(read_default "本地云端缓存目录" "$BACKUP_CLOUD_DIR")"
@@ -3035,7 +3111,12 @@ backup_cloud_settings() {
         *) warn "鉴权方式无效，保持原设置：$BACKUP_REMOTE_AUTH" ;;
     esac
 
-    BACKUP_REMOTE_REPO="$repo"
+    BACKUP_REMOTE_SLUG="$(normalize_backup_remote_slug "$repo_slug")"
+    if ! valid_backup_remote_slug "$BACKUP_REMOTE_SLUG"; then
+        warn "云端仓库格式不合法，请使用 owner/repo，例如 fk1124/EasePi-R2-Image-Backup。"
+        BACKUP_REMOTE_SLUG="fk1124/EasePi-R2-Image-Backup"
+    fi
+    refresh_backup_remote_repo
     BACKUP_REMOTE_BRANCH="$branch"
     BACKUP_REMOTE_PATH="${remote_path#/}"
     BACKUP_REMOTE_PATH="${BACKUP_REMOTE_PATH%/}"
@@ -3209,10 +3290,12 @@ backup_cloud_show_overview() {
     print_local_backups
     echo
     echo "========== 当前云端备份 =========="
-    if backup_cloud_pull; then
+    if ! backup_cloud_auth_ready; then
+        warn "云端鉴权尚未就绪，暂不读取云端列表。"
+    elif backup_cloud_pull; then
         print_cloud_backups
     else
-        warn "暂时无法读取云端备份。可先进入“云端仓库备份设置 / 鉴权设置”。"
+        warn "暂时无法读取云端备份。请检查仓库名、鉴权方式和网络。"
     fi
 }
 
