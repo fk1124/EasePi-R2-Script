@@ -89,6 +89,16 @@ trim() {
     printf '%s' "$s"
 }
 
+stable_lxc_mac() {
+    local name="$1"
+    local ifname="$2"
+    local digest
+
+    digest="$(printf 'easepi-r2-lxc:%s:%s' "$name" "$ifname" | sha256sum | awk '{print $1}')"
+    printf '02:%s:%s:%s:%s:%s\n' \
+        "${digest:0:2}" "${digest:2:2}" "${digest:4:2}" "${digest:6:2}" "${digest:8:2}"
+}
+
 load_config() {
     if [ -r "$CONFIG_FILE" ]; then
         # shellcheck disable=SC1090
@@ -1398,6 +1408,7 @@ EOF
 lxc.net.${net_idx}.type = veth
 lxc.net.${net_idx}.link = ${HOST_BR}
 lxc.net.${net_idx}.name = host0
+lxc.net.${net_idx}.hwaddr = $(stable_lxc_mac "$name" host0)
 lxc.net.${net_idx}.flags = up
 EOF
 }
@@ -1805,6 +1816,7 @@ lxc.init.cmd = /sbin/init
 lxc.net.0.type = veth
 lxc.net.0.link = ${HOST_BR}
 lxc.net.0.name = eth0
+lxc.net.0.hwaddr = $(stable_lxc_mac "$name" eth0)
 lxc.net.0.flags = up
 EOF
 }
@@ -1886,6 +1898,70 @@ set_lxc_config_key() {
     printf '%s = %s\n' "$key" "$value" >> "$tmp"
     install -m 0644 "$tmp" "$cfg"
     rm -f "$tmp"
+}
+
+get_lxc_config_key() {
+    local cfg="$1" key="$2" regex
+    [ -r "$cfg" ] || return 1
+    regex="$(printf '%s' "$key" | sed 's/[.[\*^$()+?{}|]/\\&/g')"
+    sed -nE "s/^[[:space:]]*${regex}[[:space:]]*=[[:space:]]*//p" "$cfg" | tail -n1
+}
+
+insert_lxc_net_key_after_name() {
+    local cfg="$1" idx="$2" key="$3" value="$4" tmp inserted=0
+    tmp="$(mktemp)"
+    awk -v idx="$idx" -v key="$key" -v value="$value" '
+        {
+            print
+            if (!inserted && $0 ~ "^[[:space:]]*lxc\\.net\\." idx "\\.name[[:space:]]*=") {
+                print "lxc.net." idx "." key " = " value
+                inserted = 1
+            }
+        }
+        END {
+            if (!inserted) {
+                print "lxc.net." idx "." key " = " value
+            }
+        }
+    ' "$cfg" > "$tmp"
+    install -m 0644 "$tmp" "$cfg"
+    rm -f "$tmp"
+}
+
+repair_container_stable_macs() {
+    local name="$1" cfg idx ifname mac changed=0
+
+    container_exists "$name" || die "容器不存在：$name"
+    cfg="$(container_config_for "$name")"
+
+    while read -r idx; do
+        [ -n "$idx" ] || continue
+        ifname="$(get_lxc_config_key "$cfg" "lxc.net.${idx}.name")"
+        [ -n "$ifname" ] || ifname="eth${idx}"
+        if [ -n "$(get_lxc_config_key "$cfg" "lxc.net.${idx}.hwaddr")" ]; then
+            continue
+        fi
+        mac="$(stable_lxc_mac "$name" "$ifname")"
+        insert_lxc_net_key_after_name "$cfg" "$idx" "hwaddr" "$mac"
+        ok "已为 ${name}/${ifname} 写入固定 MAC：${mac}"
+        changed=1
+    done < <(sed -nE 's/^[[:space:]]*lxc\.net\.([0-9]+)\.type[[:space:]]*=[[:space:]]*veth[[:space:]]*$/\1/p' "$cfg" | sort -n -u)
+
+    if [ "$changed" -eq 0 ]; then
+        ok "${name} 已存在固定 MAC，未修改。"
+    elif container_running "$name"; then
+        warn "${name} 正在运行；固定 MAC 需要重启该容器后生效。"
+    fi
+}
+
+repair_all_container_stable_macs() {
+    local name found=0
+    while read -r name; do
+        [ -n "$name" ] || continue
+        found=1
+        repair_container_stable_macs "$name"
+    done < <(container_names)
+    [ "$found" -eq 1 ] || warn "没有发现容器。"
 }
 
 set_container_autostart() {
@@ -2508,6 +2584,7 @@ container_manage_menu() {
         echo "7. 取消容器开机自启动"
         echo "8. 修复所有容器开机自启动"
         echo "9. 生成容器快捷命令"
+        echo "10. 补齐容器固定 MAC"
         echo "0. 返回"
         read -r -p "请选择: " choice || return 0
         case "$choice" in
@@ -2559,6 +2636,10 @@ container_manage_menu() {
                 ;;
             9)
                 write_all_container_shortcuts
+                pause_enter
+                ;;
+            10)
+                repair_all_container_stable_macs
                 pause_enter
                 ;;
             0)
