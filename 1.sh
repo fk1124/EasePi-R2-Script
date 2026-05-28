@@ -19,6 +19,15 @@ LXC_BASE="${LXC_BASE:-/lxc}"
 CONTAINER_DIR="${CONTAINER_DIR:-${LXC_BASE}/containers}"
 ROOTFS_CACHE_DIR="${ROOTFS_CACHE_DIR:-${LXC_BASE}/rootfs-cache}"
 BACKUP_DIR="${BACKUP_DIR:-${LXC_BASE}/backups}"
+BACKUP_REMOTE_REPO="${BACKUP_REMOTE_REPO:-https://github.com/fk1124/EasePi-R2-Image-Backup.git}"
+BACKUP_REMOTE_BRANCH="${BACKUP_REMOTE_BRANCH:-main}"
+BACKUP_REMOTE_PATH="${BACKUP_REMOTE_PATH:-backups}"
+BACKUP_CLOUD_DIR="${BACKUP_CLOUD_DIR:-${BACKUP_DIR}/.cloud-repo}"
+BACKUP_SPLIT_SIZE="${BACKUP_SPLIT_SIZE:-95M}"
+BACKUP_REMOTE_AUTH="${BACKUP_REMOTE_AUTH:-https-token}"
+BACKUP_REMOTE_USER="${BACKUP_REMOTE_USER:-fk1124}"
+BACKUP_REMOTE_TOKEN_FILE="${BACKUP_REMOTE_TOKEN_FILE:-${CONFIG_DIR}/github-token}"
+BACKUP_REMOTE_SSH_KEY="${BACKUP_REMOTE_SSH_KEY:-/root/.ssh/easepi_r2_image_backup}"
 
 HOST_BR="${HOST_BR:-br-hostlan}"
 HOST_IP="${HOST_IP:-10.10.0.2}"
@@ -82,11 +91,63 @@ read_default() {
     printf '%s' "${ans:-$default}"
 }
 
+menu_action() {
+    ( "$@" ) || warn "操作未完成。"
+}
+
 trim() {
     local s="$*"
     s="${s#${s%%[![:space:]]*}}"
     s="${s%${s##*[![:space:]]}}"
     printf '%s' "$s"
+}
+
+format_bytes() {
+    local bytes="${1:-0}"
+    awk -v b="$bytes" 'BEGIN {
+        split("B KB MB GB TB", u, " ");
+        i = 1;
+        while (b >= 1024 && i < 5) { b /= 1024; i++ }
+        if (i == 1) printf "%.0f%s", b, u[i];
+        else printf "%.1f%s", b, u[i];
+    }'
+}
+
+file_size_bytes() {
+    local path="$1"
+    stat -c '%s' "$path" 2>/dev/null || wc -c < "$path" 2>/dev/null || echo 0
+}
+
+dir_size_bytes() {
+    local path="$1"
+    du -sb "$path" 2>/dev/null | awk '{print $1}'
+}
+
+sanitize_backup_id() {
+    local name="$1"
+    printf '%s' "$name" | tr -c 'A-Za-z0-9_.-' '_'
+}
+
+valid_relative_path() {
+    local path="$1"
+    case "$path" in
+        ""|/*|*../*|../*|*"/.."|*"//"*|*[!A-Za-z0-9_.\/-]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+valid_backup_filename() {
+    case "$1" in
+        ""|*/*|*.partial|*[!A-Za-z0-9_.-]*) return 1 ;;
+        *.tar.zst) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+backup_container_name_from_file() {
+    local file="$1" base
+    base="$(basename "$file")"
+    printf '%s' "$base" | sed -E 's/-[0-9]{8}-[0-9]{6}\.tar\.zst$//'
 }
 
 stable_lxc_mac() {
@@ -108,6 +169,15 @@ load_config() {
     : "${CONTAINER_DIR:=${LXC_BASE}/containers}"
     : "${ROOTFS_CACHE_DIR:=${LXC_BASE}/rootfs-cache}"
     : "${BACKUP_DIR:=${LXC_BASE}/backups}"
+    : "${BACKUP_REMOTE_REPO:=https://github.com/fk1124/EasePi-R2-Image-Backup.git}"
+    : "${BACKUP_REMOTE_BRANCH:=main}"
+    : "${BACKUP_REMOTE_PATH:=backups}"
+    : "${BACKUP_CLOUD_DIR:=${BACKUP_DIR}/.cloud-repo}"
+    : "${BACKUP_SPLIT_SIZE:=95M}"
+    : "${BACKUP_REMOTE_AUTH:=https-token}"
+    : "${BACKUP_REMOTE_USER:=fk1124}"
+    : "${BACKUP_REMOTE_TOKEN_FILE:=${CONFIG_DIR}/github-token}"
+    : "${BACKUP_REMOTE_SSH_KEY:=/root/.ssh/easepi_r2_image_backup}"
     : "${HOST_BR:=br-hostlan}"
     : "${HOST_IP:=10.10.0.2}"
     : "${HOST_IP_CIDR:=10.10.0.2/24}"
@@ -127,6 +197,15 @@ save_config() {
         printf 'CONTAINER_DIR=%q\n' "$CONTAINER_DIR"
         printf 'ROOTFS_CACHE_DIR=%q\n' "$ROOTFS_CACHE_DIR"
         printf 'BACKUP_DIR=%q\n' "$BACKUP_DIR"
+        printf 'BACKUP_REMOTE_REPO=%q\n' "$BACKUP_REMOTE_REPO"
+        printf 'BACKUP_REMOTE_BRANCH=%q\n' "$BACKUP_REMOTE_BRANCH"
+        printf 'BACKUP_REMOTE_PATH=%q\n' "$BACKUP_REMOTE_PATH"
+        printf 'BACKUP_CLOUD_DIR=%q\n' "$BACKUP_CLOUD_DIR"
+        printf 'BACKUP_SPLIT_SIZE=%q\n' "$BACKUP_SPLIT_SIZE"
+        printf 'BACKUP_REMOTE_AUTH=%q\n' "$BACKUP_REMOTE_AUTH"
+        printf 'BACKUP_REMOTE_USER=%q\n' "$BACKUP_REMOTE_USER"
+        printf 'BACKUP_REMOTE_TOKEN_FILE=%q\n' "$BACKUP_REMOTE_TOKEN_FILE"
+        printf 'BACKUP_REMOTE_SSH_KEY=%q\n' "$BACKUP_REMOTE_SSH_KEY"
         printf 'HOST_BR=%q\n' "$HOST_BR"
         printf 'HOST_IP=%q\n' "$HOST_IP"
         printf 'HOST_IP_CIDR=%q\n' "$HOST_IP_CIDR"
@@ -189,6 +268,7 @@ install_lxc_dependencies() {
         fuse-overlayfs slirp4netns criu
         iproute2 iputils-ping ethtool bridge-utils
         curl wget ca-certificates rsync zstd xz-utils gzip tar unzip
+        git pv
         jq kmod parted util-linux e2fsprogs dosfstools
         openssh-client
     )
@@ -1705,6 +1785,16 @@ container_running() {
     lxc-info -P "$CONTAINER_DIR" -n "$1" -s 2>/dev/null | grep -q RUNNING
 }
 
+container_dir_safe() {
+    local name="$1" dir base_real parent_real
+    valid_container_name "$name" || return 1
+    dir="$(container_dir_for "$name")"
+    mkdir -p "$CONTAINER_DIR"
+    base_real="$(cd "$CONTAINER_DIR" && pwd -P)"
+    parent_real="$(cd "$(dirname "$dir")" && pwd -P 2>/dev/null || true)"
+    [ "$parent_real" = "$base_real" ]
+}
+
 ensure_single_router_running() {
     local target="$1"
     local name
@@ -1868,7 +1958,7 @@ container_names() {
 
 valid_container_name() {
     case "$1" in
-        ""|*/*|*[!A-Za-z0-9_.-]*) return 1 ;;
+        ""|"."|".."|*/*|*[!A-Za-z0-9_.-]*) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -2118,8 +2208,8 @@ prompt_container_name() {
     echo >&2
     list_containers >&2 || true
     read -r -p "$prompt: " name || name=""
-    valid_container_name "$name" || die "容器名称不合法：$name"
-    container_exists "$name" || die "容器不存在：$name"
+    valid_container_name "$name" || { warn "容器名称不合法：$name"; return 1; }
+    container_exists "$name" || { warn "容器不存在：$name"; return 1; }
     echo "$name"
 }
 
@@ -2229,6 +2319,44 @@ write_all_container_shortcuts() {
         [ -n "$name" ] || continue
         write_container_shortcut "$name"
     done < <(container_names)
+}
+
+delete_container() {
+    local name confirm_name dir shortcut
+    echo
+    echo "========== 删除容器 =========="
+    name="$(prompt_container_name "请输入要删除的容器名称")" || return 1
+    dir="$(container_dir_for "$name")"
+    container_dir_safe "$name" || {
+        warn "容器目录安全校验失败：$dir"
+        return 1
+    }
+    if container_running "$name"; then
+        warn "容器 $name 正在运行。请先停止容器后再删除。"
+        return 1
+    fi
+
+    warn "此操作会永久删除容器目录：$dir"
+    read -r -p "请输入完整容器名称确认删除: " confirm_name || confirm_name=""
+    if [ "$confirm_name" != "$name" ]; then
+        warn "确认内容不匹配，已取消删除。"
+        return 1
+    fi
+    confirm "最后确认删除容器 ${name}？" n || { warn "已取消删除。"; return 1; }
+
+    if command_exists lxc-destroy; then
+        lxc-destroy -P "$CONTAINER_DIR" -n "$name"
+    else
+        warn "未找到 lxc-destroy，请先安装 LXC 依赖。"
+        return 1
+    fi
+
+    shortcut="/usr/local/bin/$name"
+    if [ -f "$shortcut" ] && grep -qs 'EasePi-R2 LXC container shortcut' "$shortcut"; then
+        rm -f "$shortcut"
+        ok "已删除快捷命令：$shortcut"
+    fi
+    ok "容器已删除：$name"
 }
 
 default_openwrt_container_name() {
@@ -2512,44 +2640,606 @@ fi
 EOS
 }
 
+backup_local_files() {
+    [ -d "$BACKUP_DIR" ] || return 0
+    find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.tar.zst' -printf '%T@\t%p\n' 2>/dev/null | sort -rn | cut -f2-
+}
+
+print_local_backups() {
+    local -a files
+    local idx file base size mtime
+    mapfile -t files < <(backup_local_files)
+    if [ "${#files[@]}" -eq 0 ]; then
+        echo "  无本地备份。"
+        return 0
+    fi
+    idx=1
+    for file in "${files[@]}"; do
+        base="$(basename "$file")"
+        size="$(format_bytes "$(file_size_bytes "$file")")"
+        mtime="$(date -r "$file" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown)"
+        printf '  %2d. %-42s %9s  %s\n' "$idx" "$base" "$size" "$mtime"
+        idx=$((idx + 1))
+    done
+}
+
+select_local_backup() {
+    local prompt="${1:-请输入备份序号或文件名}"
+    local -a files
+    local input idx file
+    mkdir -p "$BACKUP_DIR"
+    mapfile -t files < <(backup_local_files)
+    if [ "${#files[@]}" -eq 0 ]; then
+        warn "没有可用的本地备份。"
+        return 1
+    fi
+    print_local_backups >&2
+    read -r -p "$prompt: " input || input=""
+    input="$(trim "$input")"
+    [ -n "$input" ] || { warn "未输入备份。"; return 1; }
+    case "$input" in
+        *[!0-9]*)
+            case "$input" in
+                /*) file="$input" ;;
+                *) file="${BACKUP_DIR}/${input}" ;;
+            esac
+            ;;
+        *)
+            idx=$((10#$input))
+            if [ "$idx" -lt 1 ] || [ "$idx" -gt "${#files[@]}" ]; then
+                warn "备份序号超出范围：$input"
+                return 1
+            fi
+            file="${files[$((idx - 1))]}"
+            ;;
+    esac
+    [ -f "$file" ] || { warn "备份文件不存在：$file"; return 1; }
+    valid_backup_filename "$(basename "$file")" || { warn "备份文件名不合法：$(basename "$file")"; return 1; }
+    case "$file" in
+        "$BACKUP_DIR"/*.tar.zst) ;;
+        *) warn "只支持还原 ${BACKUP_DIR} 下的本地 .tar.zst 备份。"; return 1 ;;
+    esac
+    printf '%s\n' "$file"
+}
+
+write_backup_sha256() {
+    local file="$1" dir base
+    dir="$(dirname "$file")"
+    base="$(basename "$file")"
+    (cd "$dir" && sha256sum "$base" > "${base}.sha256")
+}
+
+verify_backup_sha256() {
+    local file="$1" dir base sha_file
+    dir="$(dirname "$file")"
+    base="$(basename "$file")"
+    sha_file="${file}.sha256"
+    [ -f "$sha_file" ] || return 0
+    if (cd "$dir" && sha256sum -c "$(basename "$sha_file")"); then
+        ok "备份校验通过：$(basename "$sha_file")"
+        return 0
+    fi
+    warn "备份校验失败：$sha_file"
+    return 1
+}
+
 backup_container() {
-    local name dir file
+    local name dir file tmp size
+    echo
+    echo "========== 备份容器（必须关机） =========="
     list_containers
     read -r -p "请输入要备份的容器名称: " name || name=""
-    [ -n "$name" ] || die "容器名称不能为空。"
-    dir="$(container_dir_for "$name")"
-    [ -d "$dir" ] || die "容器不存在：$name"
+    name="$(trim "$name")"
+    valid_container_name "$name" || { warn "容器名称不合法：$name"; return 1; }
+    container_exists "$name" || { warn "容器不存在：$name"; return 1; }
     if container_running "$name"; then
-        die "容器 $name 正在运行。请先 lxc-stop 后再备份。"
+        warn "容器 $name 正在运行。请先停止容器后再备份。"
+        return 1
     fi
+
+    dir="$(container_dir_for "$name")"
+    size="$(dir_size_bytes "$dir")"
+    [ -n "$size" ] || size=0
     mkdir -p "$BACKUP_DIR"
     file="${BACKUP_DIR}/${name}-$(date +%Y%m%d-%H%M%S).tar.zst"
-    tar --numeric-owner --xattrs -C "$CONTAINER_DIR" -I 'zstd -19 -T0' -cpf "$file" "$name"
+    tmp="${file}.partial"
+    rm -f "$tmp"
+
+    echo "容器目录：$dir"
+    echo "预计大小：$(format_bytes "$size")"
+    echo "输出文件：$file"
+    echo "开始备份..."
+
+    if command_exists pv; then
+        if ! tar --numeric-owner --xattrs -C "$CONTAINER_DIR" -cpf - "$name" | pv -s "$size" -p -t -e -r -b | zstd -19 -T0 -q > "$tmp"; then
+            rm -f "$tmp"
+            warn "备份失败。"
+            return 1
+        fi
+    else
+        warn "未安装 pv，备份期间不会显示进度。"
+        if ! tar --numeric-owner --xattrs -C "$CONTAINER_DIR" -cpf - "$name" | zstd -19 -T0 -q > "$tmp"; then
+            rm -f "$tmp"
+            warn "备份失败。"
+            return 1
+        fi
+    fi
+
+    mv -f "$tmp" "$file"
+    write_backup_sha256 "$file"
     ok "备份完成：$file"
 }
 
 restore_container() {
-    local file name first
-    mkdir -p "$BACKUP_DIR"
+    local file name first size dir
+    mkdir -p "$BACKUP_DIR" "$CONTAINER_DIR"
     echo
-    echo "========== 可用备份 =========="
-    find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.tar.zst' -printf '  %f\n' 2>/dev/null || true
-    read -r -p "请输入要还原的备份文件名或完整路径: " file || file=""
-    [ -n "$file" ] || die "备份文件不能为空。"
-    case "$file" in
-        /*) ;;
-        *) file="${BACKUP_DIR}/${file}" ;;
-    esac
-    [ -f "$file" ] || die "备份文件不存在：$file"
+    echo "========== 还原容器（仅本地备份） =========="
+    file="$(select_local_backup "请输入要还原的备份序号或文件名")" || return 1
+    verify_backup_sha256 "$file" || return 1
 
     set +o pipefail
-    first="$(tar -I zstd -tf "$file" 2>/dev/null | head -n1)"
+    first="$(tar -I zstd -tf "$file" 2>/dev/null | head -n1 || true)"
     set -o pipefail
     name="$(printf '%s' "$first" | cut -d/ -f1)"
-    [ -n "$name" ] || die "无法识别备份内的容器名称。"
-    [ ! -e "$(container_dir_for "$name")" ] || die "容器 $name 已存在，请先改名或删除。"
-    tar --numeric-owner --xattrs -I zstd -xpf "$file" -C "$CONTAINER_DIR"
+    valid_container_name "$name" || { warn "无法识别备份内的容器名称。"; return 1; }
+    if [ -e "$(container_dir_for "$name")" ]; then
+        warn "容器 $name 已存在，请先改名或删除。"
+        return 1
+    fi
+    dir="$(container_dir_for "$name")"
+
+    echo "备份文件：$file"
+    echo "还原容器：$name"
+    confirm "确认开始还原？" y || { warn "已取消还原。"; return 1; }
+
+    size="$(file_size_bytes "$file")"
+    echo "开始还原..."
+    if command_exists pv; then
+        if ! pv -s "$size" "$file" | zstd -dc | tar --numeric-owner --xattrs -xpf - -C "$CONTAINER_DIR"; then
+            [ -d "$dir" ] && rm -rf "$dir"
+            warn "还原失败。"
+            return 1
+        fi
+    else
+        warn "未安装 pv，还原期间不会显示进度。"
+        if ! tar --numeric-owner --xattrs -I zstd -xpf "$file" -C "$CONTAINER_DIR"; then
+            [ -d "$dir" ] && rm -rf "$dir"
+            warn "还原失败。"
+            return 1
+        fi
+    fi
+
+    repair_container_stable_macs "$name" || true
+    write_container_shortcut "$name" || true
     ok "还原完成：$name"
+}
+
+backup_git_askpass_script() {
+    local askpass
+    askpass="$(mktemp /tmp/easepi-r2-git-askpass.XXXXXX)"
+    cat > "$askpass" <<'EOF'
+#!/bin/sh
+case "$1" in
+    *Username*) printf '%s\n' "${GIT_BACKUP_USER:-x-access-token}" ;;
+    *Password*) cat "${GIT_BACKUP_TOKEN_FILE:?}" ;;
+    *) printf '\n' ;;
+esac
+EOF
+    chmod 700 "$askpass"
+    echo "$askpass"
+}
+
+run_backup_git() {
+    local askpass rc
+    case "$BACKUP_REMOTE_AUTH" in
+        https-token)
+            [ -r "$BACKUP_REMOTE_TOKEN_FILE" ] || {
+                warn "未配置 GitHub Token：$BACKUP_REMOTE_TOKEN_FILE"
+                return 1
+            }
+            askpass="$(backup_git_askpass_script)" || return 1
+            if GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$askpass" GIT_BACKUP_USER="${BACKUP_REMOTE_USER:-x-access-token}" GIT_BACKUP_TOKEN_FILE="$BACKUP_REMOTE_TOKEN_FILE" git "$@"; then
+                rc=0
+            else
+                rc=$?
+            fi
+            rm -f "$askpass"
+            return "$rc"
+            ;;
+        ssh)
+            [ -r "$BACKUP_REMOTE_SSH_KEY" ] || {
+                warn "未找到 SSH 私钥：$BACKUP_REMOTE_SSH_KEY"
+                return 1
+            }
+            if GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -i $BACKUP_REMOTE_SSH_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" git "$@"; then
+                return 0
+            else
+                rc=$?
+                return "$rc"
+            fi
+            ;;
+        none)
+            if GIT_TERMINAL_PROMPT=0 git "$@"; then
+                return 0
+            else
+                rc=$?
+                return "$rc"
+            fi
+            ;;
+        *)
+            warn "未知云端鉴权方式：$BACKUP_REMOTE_AUTH"
+            return 1
+            ;;
+    esac
+}
+
+ensure_backup_cloud_repo() {
+    mkdir -p "$(dirname "$BACKUP_CLOUD_DIR")"
+    if [ ! -d "$BACKUP_CLOUD_DIR/.git" ]; then
+        if [ -e "$BACKUP_CLOUD_DIR" ] && dir_has_entries "$BACKUP_CLOUD_DIR"; then
+            warn "$BACKUP_CLOUD_DIR 已存在但不是 git 仓库，请清理或修改云端本地缓存目录。"
+            return 1
+        fi
+        echo "正在初始化云端仓库缓存：$BACKUP_CLOUD_DIR"
+        run_backup_git clone -q "$BACKUP_REMOTE_REPO" "$BACKUP_CLOUD_DIR" || {
+            warn "克隆云端仓库失败。"
+            return 1
+        }
+    fi
+
+    if git -C "$BACKUP_CLOUD_DIR" remote get-url origin >/dev/null 2>&1; then
+        git -C "$BACKUP_CLOUD_DIR" remote set-url origin "$BACKUP_REMOTE_REPO"
+    else
+        git -C "$BACKUP_CLOUD_DIR" remote add origin "$BACKUP_REMOTE_REPO"
+    fi
+    git -C "$BACKUP_CLOUD_DIR" config user.name "EasePi-R2 Backup"
+    git -C "$BACKUP_CLOUD_DIR" config user.email "fk1124@users.noreply.github.com"
+    git -C "$BACKUP_CLOUD_DIR" config core.autocrlf false
+
+    if run_backup_git -C "$BACKUP_CLOUD_DIR" ls-remote --exit-code --heads origin "$BACKUP_REMOTE_BRANCH" >/dev/null 2>&1; then
+        run_backup_git -C "$BACKUP_CLOUD_DIR" fetch -q origin "$BACKUP_REMOTE_BRANCH" || return 1
+        git -C "$BACKUP_CLOUD_DIR" checkout -q -B "$BACKUP_REMOTE_BRANCH" "origin/$BACKUP_REMOTE_BRANCH"
+    else
+        git -C "$BACKUP_CLOUD_DIR" checkout -q -B "$BACKUP_REMOTE_BRANCH"
+    fi
+    mkdir -p "${BACKUP_CLOUD_DIR}/${BACKUP_REMOTE_PATH}"
+}
+
+backup_cloud_pull() {
+    ensure_backup_cloud_repo || return 1
+    if run_backup_git -C "$BACKUP_CLOUD_DIR" ls-remote --exit-code --heads origin "$BACKUP_REMOTE_BRANCH" >/dev/null 2>&1; then
+        run_backup_git -C "$BACKUP_CLOUD_DIR" fetch -q origin "$BACKUP_REMOTE_BRANCH" || return 1
+        git -C "$BACKUP_CLOUD_DIR" merge --ff-only "origin/${BACKUP_REMOTE_BRANCH}" >/dev/null 2>&1 || {
+            warn "云端仓库存在本地未合并变更，请先手动处理：$BACKUP_CLOUD_DIR"
+            return 1
+        }
+    fi
+}
+
+backup_manifest_value() {
+    local file="$1" key="$2"
+    sed -n "s/^${key}=//p" "$file" 2>/dev/null | head -n1
+}
+
+cloud_manifest_files() {
+    local base="${BACKUP_CLOUD_DIR}/${BACKUP_REMOTE_PATH}"
+    [ -d "$base" ] || return 0
+    find "$base" -mindepth 2 -maxdepth 2 -type f -name manifest.env -printf '%T@\t%p\n' 2>/dev/null | sort -rn | cut -f2-
+}
+
+print_cloud_backups() {
+    local -a manifests
+    local idx manifest id name size created parts
+    mapfile -t manifests < <(cloud_manifest_files)
+    if [ "${#manifests[@]}" -eq 0 ]; then
+        echo "  无云端备份。"
+        return 0
+    fi
+    idx=1
+    for manifest in "${manifests[@]}"; do
+        id="$(backup_manifest_value "$manifest" BACKUP_ID)"
+        name="$(backup_manifest_value "$manifest" CONTAINER_NAME)"
+        size="$(backup_manifest_value "$manifest" SIZE_BYTES)"
+        created="$(backup_manifest_value "$manifest" CREATED_AT)"
+        parts="$(backup_manifest_value "$manifest" PARTS)"
+        printf '  %2d. %-36s %-12s %9s  parts:%s  %s\n' \
+            "$idx" "${id:-unknown}" "${name:-unknown}" "$(format_bytes "${size:-0}")" "${parts:-?}" "${created:-unknown}"
+        idx=$((idx + 1))
+    done
+}
+
+select_cloud_backup() {
+    local prompt="${1:-请输入云端备份序号或备份 ID}"
+    local -a manifests
+    local input idx manifest
+    mapfile -t manifests < <(cloud_manifest_files)
+    if [ "${#manifests[@]}" -eq 0 ]; then
+        warn "没有可用的云端备份。"
+        return 1
+    fi
+    print_cloud_backups >&2
+    read -r -p "$prompt: " input || input=""
+    input="$(trim "$input")"
+    [ -n "$input" ] || { warn "未输入云端备份。"; return 1; }
+    case "$input" in
+        *[!0-9]*)
+            case "$input" in
+                ""|*/*|*[!A-Za-z0-9_.-]*) warn "备份 ID 不合法：$input"; return 1 ;;
+            esac
+            manifest="${BACKUP_CLOUD_DIR}/${BACKUP_REMOTE_PATH}/${input}/manifest.env"
+            ;;
+        *)
+            idx=$((10#$input))
+            if [ "$idx" -lt 1 ] || [ "$idx" -gt "${#manifests[@]}" ]; then
+                warn "云端备份序号超出范围：$input"
+                return 1
+            fi
+            manifest="${manifests[$((idx - 1))]}"
+            ;;
+    esac
+    [ -f "$manifest" ] || { warn "云端备份不存在：$input"; return 1; }
+    printf '%s\n' "$manifest"
+}
+
+backup_cloud_commit_push() {
+    local message="$1"
+    git -C "$BACKUP_CLOUD_DIR" add -A -- .
+    if git -C "$BACKUP_CLOUD_DIR" diff --cached --quiet; then
+        if git -C "$BACKUP_CLOUD_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+            if [ -n "$(git -C "$BACKUP_CLOUD_DIR" log --oneline '@{u}..HEAD' 2>/dev/null || true)" ]; then
+                run_backup_git -C "$BACKUP_CLOUD_DIR" push -q origin "$BACKUP_REMOTE_BRANCH" || {
+                    warn "推送云端仓库失败。"
+                    return 1
+                }
+                ok "已推送之前未同步的云端提交。"
+                return 0
+            fi
+        fi
+        if git -C "$BACKUP_CLOUD_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
+            ok "没有需要提交的云端变更。"
+            return 0
+        fi
+    fi
+    git -C "$BACKUP_CLOUD_DIR" commit -q -m "$message" || return 1
+    run_backup_git -C "$BACKUP_CLOUD_DIR" push -q -u origin "$BACKUP_REMOTE_BRANCH" || {
+        warn "推送云端仓库失败。"
+        return 1
+    }
+}
+
+backup_cloud_settings() {
+    local repo branch remote_path cache_dir split_size auth_choice token key_pub
+    echo
+    echo "========== 云端仓库备份设置 =========="
+    echo "当前仓库      ：$BACKUP_REMOTE_REPO"
+    echo "当前分支      ：$BACKUP_REMOTE_BRANCH"
+    echo "云端目录      ：$BACKUP_REMOTE_PATH"
+    echo "本地缓存      ：$BACKUP_CLOUD_DIR"
+    echo "分片大小      ：$BACKUP_SPLIT_SIZE"
+    echo "鉴权方式      ：$BACKUP_REMOTE_AUTH"
+    echo
+
+    repo="$(read_default "云端 git 仓库" "$BACKUP_REMOTE_REPO")"
+    branch="$(read_default "云端分支" "$BACKUP_REMOTE_BRANCH")"
+    remote_path="$(read_default "云端备份目录" "$BACKUP_REMOTE_PATH")"
+    cache_dir="$(read_default "本地云端缓存目录" "$BACKUP_CLOUD_DIR")"
+    split_size="$(read_default "上传分片大小（建议 95M）" "$BACKUP_SPLIT_SIZE")"
+    echo "鉴权方式：1. HTTPS Token  2. SSH Key  3. 无鉴权"
+    read -r -p "请选择鉴权方式，直接回车保持当前设置: " auth_choice || auth_choice=""
+    case "$auth_choice" in
+        1) BACKUP_REMOTE_AUTH="https-token" ;;
+        2) BACKUP_REMOTE_AUTH="ssh" ;;
+        3) BACKUP_REMOTE_AUTH="none" ;;
+        "") ;;
+        *) warn "鉴权方式无效，保持原设置：$BACKUP_REMOTE_AUTH" ;;
+    esac
+
+    BACKUP_REMOTE_REPO="$repo"
+    BACKUP_REMOTE_BRANCH="$branch"
+    BACKUP_REMOTE_PATH="${remote_path#/}"
+    BACKUP_REMOTE_PATH="${BACKUP_REMOTE_PATH%/}"
+    valid_relative_path "$BACKUP_REMOTE_PATH" || {
+        warn "云端备份目录不合法，已恢复为 backups。"
+        BACKUP_REMOTE_PATH="backups"
+    }
+    BACKUP_CLOUD_DIR="${cache_dir%/}"
+    BACKUP_SPLIT_SIZE="$split_size"
+
+    if [ "$BACKUP_REMOTE_AUTH" = "https-token" ]; then
+        mkdir -p "$(dirname "$BACKUP_REMOTE_TOKEN_FILE")"
+        chmod 700 "$(dirname "$BACKUP_REMOTE_TOKEN_FILE")" 2>/dev/null || true
+        echo
+        echo "Token 文件：$BACKUP_REMOTE_TOKEN_FILE"
+        read -r -s -p "请输入新的 GitHub Token（留空则不修改）: " token || token=""
+        echo
+        if [ -n "$token" ]; then
+            umask 077
+            printf '%s\n' "$token" > "$BACKUP_REMOTE_TOKEN_FILE"
+            chmod 600 "$BACKUP_REMOTE_TOKEN_FILE"
+            ok "Token 已保存。"
+        elif [ ! -r "$BACKUP_REMOTE_TOKEN_FILE" ]; then
+            warn "尚未配置 Token，云端私有仓库无法同步。"
+        fi
+    elif [ "$BACKUP_REMOTE_AUTH" = "ssh" ]; then
+        if [ ! -f "$BACKUP_REMOTE_SSH_KEY" ]; then
+            if command_exists ssh-keygen && confirm "未找到 SSH Key，是否现在生成？" y; then
+                mkdir -p "$(dirname "$BACKUP_REMOTE_SSH_KEY")"
+                ssh-keygen -t ed25519 -N "" -C "easepi-r2-image-backup" -f "$BACKUP_REMOTE_SSH_KEY"
+            else
+                warn "请先准备 SSH Key：$BACKUP_REMOTE_SSH_KEY"
+            fi
+        fi
+        key_pub="${BACKUP_REMOTE_SSH_KEY}.pub"
+        if [ -f "$key_pub" ]; then
+            echo
+            echo "请把下面的公钥添加到 GitHub 仓库 Deploy keys 或账号 SSH keys："
+            cat "$key_pub"
+        fi
+    fi
+
+    save_config
+    ok "云端备份设置已保存。"
+}
+
+backup_cloud_upload() {
+    local file base backup_id dest size sha created parts container_name
+    file="$(select_local_backup "请输入要上传的本地备份序号或文件名")" || return 1
+    backup_cloud_pull || return 1
+
+    base="$(basename "$file")"
+    backup_id="$(sanitize_backup_id "${base%.tar.zst}")"
+    container_name="$(backup_container_name_from_file "$base")"
+    dest="${BACKUP_CLOUD_DIR}/${BACKUP_REMOTE_PATH}/${backup_id}"
+    if [ -e "$dest" ]; then
+        confirm "云端已存在 ${backup_id}，是否覆盖？" n || { warn "已取消上传。"; return 1; }
+        rm -rf "$dest"
+    fi
+    mkdir -p "$dest"
+
+    size="$(file_size_bytes "$file")"
+    sha="$(sha256sum "$file" | awk '{print $1}')"
+    created="$(date -r "$file" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')"
+    echo "正在分片：$base -> $backup_id（每片 $BACKUP_SPLIT_SIZE）"
+    if ! split -b "$BACKUP_SPLIT_SIZE" -d -a 3 "$file" "${dest}/${backup_id}.tar.zst.part-"; then
+        rm -rf "$dest"
+        warn "备份分片失败。"
+        return 1
+    fi
+    parts="$(find "$dest" -maxdepth 1 -type f -name '*.part-*' | wc -l | tr -d ' ')"
+    {
+        printf 'BACKUP_ID=%s\n' "$backup_id"
+        printf 'BACKUP_FILE=%s\n' "$base"
+        printf 'CONTAINER_NAME=%s\n' "$container_name"
+        printf 'CREATED_AT=%s\n' "$created"
+        printf 'SIZE_BYTES=%s\n' "$size"
+        printf 'SHA256=%s\n' "$sha"
+        printf 'PARTS=%s\n' "$parts"
+        printf 'SPLIT_SIZE=%s\n' "$BACKUP_SPLIT_SIZE"
+    } > "${dest}/manifest.env"
+
+    backup_cloud_commit_push "Upload LXC backup ${backup_id}" || return 1
+    ok "已上传云端备份：$backup_id"
+}
+
+backup_cloud_download() {
+    local manifest dir backup_id backup_file dest tmp sha size total
+    local -a parts
+    backup_cloud_pull || return 1
+    manifest="$(select_cloud_backup "请输入要下载的云端备份序号或备份 ID")" || return 1
+    dir="$(dirname "$manifest")"
+    backup_id="$(backup_manifest_value "$manifest" BACKUP_ID)"
+    backup_file="$(backup_manifest_value "$manifest" BACKUP_FILE)"
+    sha="$(backup_manifest_value "$manifest" SHA256)"
+    [ -n "$backup_file" ] || backup_file="${backup_id}.tar.zst"
+    mkdir -p "$BACKUP_DIR"
+    dest="${BACKUP_DIR}/${backup_file}"
+    tmp="${dest}.partial"
+    if [ -e "$dest" ]; then
+        confirm "本地已存在 ${backup_file}，是否覆盖？" n || { warn "已取消下载。"; return 1; }
+    fi
+    mapfile -t parts < <(find "$dir" -maxdepth 1 -type f -name '*.part-*' | sort)
+    if [ "${#parts[@]}" -eq 0 ]; then
+        warn "云端备份缺少分片文件：$backup_id"
+        return 1
+    fi
+    total="$(find "$dir" -maxdepth 1 -type f -name '*.part-*' -printf '%s\n' | awk '{s+=$1} END {print s+0}')"
+    rm -f "$tmp"
+    echo "正在下载到本地：$dest"
+    if command_exists pv; then
+        if ! cat "${parts[@]}" | pv -s "$total" > "$tmp"; then
+            rm -f "$tmp"
+            warn "合并云端分片失败。"
+            return 1
+        fi
+    else
+        if ! cat "${parts[@]}" > "$tmp"; then
+            rm -f "$tmp"
+            warn "合并云端分片失败。"
+            return 1
+        fi
+    fi
+    if [ -n "$sha" ]; then
+        size="$(file_size_bytes "$tmp")"
+        echo "已合并大小：$(format_bytes "$size")，正在校验 SHA256..."
+        if ! echo "${sha}  ${tmp}" | sha256sum -c -; then
+            rm -f "$tmp"
+            warn "下载文件校验失败。"
+            return 1
+        fi
+    fi
+    mv -f "$tmp" "$dest"
+    write_backup_sha256 "$dest"
+    ok "云端备份已下载到本地：$dest"
+}
+
+backup_local_delete() {
+    local file
+    file="$(select_local_backup "请输入要删除的本地备份序号或文件名")" || return 1
+    warn "即将删除本地备份：$file"
+    confirm "确认删除？" n || { warn "已取消删除。"; return 1; }
+    rm -f "$file" "${file}.sha256"
+    ok "已删除本地备份：$(basename "$file")"
+}
+
+backup_cloud_delete() {
+    local manifest backup_id confirm_id rel
+    backup_cloud_pull || return 1
+    manifest="$(select_cloud_backup "请输入要删除的云端备份序号或备份 ID")" || return 1
+    backup_id="$(backup_manifest_value "$manifest" BACKUP_ID)"
+    [ -n "$backup_id" ] || { warn "无法识别云端备份 ID。"; return 1; }
+    warn "即将删除云端备份：$backup_id"
+    read -r -p "请输入完整备份 ID 确认删除: " confirm_id || confirm_id=""
+    if [ "$confirm_id" != "$backup_id" ]; then
+        warn "确认内容不匹配，已取消删除。"
+        return 1
+    fi
+    rel="${BACKUP_REMOTE_PATH}/${backup_id}"
+    git -C "$BACKUP_CLOUD_DIR" rm -r -q -- "$rel" || {
+        warn "删除云端备份文件失败。"
+        return 1
+    }
+    backup_cloud_commit_push "Delete LXC backup ${backup_id}" || return 1
+    ok "已删除云端备份：$backup_id"
+}
+
+backup_cloud_show_overview() {
+    echo
+    echo "========== 当前本地备份 =========="
+    print_local_backups
+    echo
+    echo "========== 当前云端备份 =========="
+    if backup_cloud_pull; then
+        print_cloud_backups
+    else
+        warn "暂时无法读取云端备份。可先进入“云端仓库备份设置 / 鉴权设置”。"
+    fi
+}
+
+backup_cloud_sync_menu() {
+    local choice
+    while true; do
+        echo
+        echo "========== 云端 git 同步管理 =========="
+        backup_cloud_show_overview
+        echo
+        echo "1. 云端仓库备份设置 / 鉴权设置"
+        echo "2. 本地备份上传云端"
+        echo "3. 云端备份下载本地"
+        echo "4. 删除本地备份"
+        echo "5. 删除云端备份"
+        echo "0. 返回"
+        read -r -p "请选择: " choice || return 0
+        case "$choice" in
+            1) menu_action backup_cloud_settings; load_config; pause_enter ;;
+            2) menu_action backup_cloud_upload; pause_enter ;;
+            3) menu_action backup_cloud_download; pause_enter ;;
+            4) menu_action backup_local_delete; pause_enter ;;
+            5) menu_action backup_cloud_delete; pause_enter ;;
+            0) return 0 ;;
+            *) warn "无效选择。" ;;
+        esac
+    done
 }
 
 backup_restore_menu() {
@@ -2558,12 +3248,14 @@ backup_restore_menu() {
         echo
         echo "========== LXC 备份 / 还原 =========="
         echo "1. 备份容器（必须关机）"
-        echo "2. 还原容器"
+        echo "2. 云端 git 同步管理"
+        echo "3. 还原容器（仅本地备份）"
         echo "0. 返回"
         read -r -p "请选择: " choice || return 0
         case "$choice" in
-            1) backup_container; pause_enter ;;
-            2) restore_container; pause_enter ;;
+            1) menu_action backup_container; pause_enter ;;
+            2) backup_cloud_sync_menu ;;
+            3) menu_action restore_container; pause_enter ;;
             0) return 0 ;;
             *) warn "无效选择。" ;;
         esac
@@ -2585,6 +3277,7 @@ container_manage_menu() {
         echo "8. 修复所有容器开机自启动"
         echo "9. 生成容器快捷命令"
         echo "10. 补齐容器固定 MAC"
+        echo "11. 删除容器"
         echo "0. 返回"
         read -r -p "请选择: " choice || return 0
         case "$choice" in
@@ -2593,26 +3286,26 @@ container_manage_menu() {
                 pause_enter
                 ;;
             2)
-                name="$(prompt_container_name "请输入要启动的容器名称")"
-                start_container_by_name "$name"
+                name="$(prompt_container_name "请输入要启动的容器名称")" || { pause_enter; continue; }
+                menu_action start_container_by_name "$name"
                 pause_enter
                 ;;
             3)
-                name="$(prompt_container_name "请输入要停止的容器名称")"
-                stop_container_by_name "$name"
+                name="$(prompt_container_name "请输入要停止的容器名称")" || { pause_enter; continue; }
+                menu_action stop_container_by_name "$name"
                 pause_enter
                 ;;
             4)
-                name="$(prompt_container_name "请输入要重启的容器名称")"
-                restart_container_by_name "$name"
+                name="$(prompt_container_name "请输入要重启的容器名称")" || { pause_enter; continue; }
+                menu_action restart_container_by_name "$name"
                 pause_enter
                 ;;
             5)
-                name="$(prompt_container_name "请输入要进入的容器名称")"
-                attach_container_by_name "$name"
+                name="$(prompt_container_name "请输入要进入的容器名称")" || { pause_enter; continue; }
+                menu_action attach_container_by_name "$name"
                 ;;
             6)
-                name="$(prompt_container_name "请输入要启用自启动的容器名称")"
+                name="$(prompt_container_name "请输入要启用自启动的容器名称")" || { pause_enter; continue; }
                 if container_is_openwrt_router "$name"; then
                     warn "OpenWrt 路由容器同一时间只建议一个开机自启动。"
                     while read -r other; do
@@ -2622,24 +3315,28 @@ container_manage_menu() {
                         fi
                     done < <(container_names)
                 fi
-                set_container_autostart "$name" 1
+                menu_action set_container_autostart "$name" 1
                 pause_enter
                 ;;
             7)
-                name="$(prompt_container_name "请输入要取消自启动的容器名称")"
-                set_container_autostart "$name" 0
+                name="$(prompt_container_name "请输入要取消自启动的容器名称")" || { pause_enter; continue; }
+                menu_action set_container_autostart "$name" 0
                 pause_enter
                 ;;
             8)
-                repair_all_container_autostart
+                menu_action repair_all_container_autostart
                 pause_enter
                 ;;
             9)
-                write_all_container_shortcuts
+                menu_action write_all_container_shortcuts
                 pause_enter
                 ;;
             10)
-                repair_all_container_stable_macs
+                menu_action repair_all_container_stable_macs
+                pause_enter
+                ;;
+            11)
+                menu_action delete_container
                 pause_enter
                 ;;
             0)
