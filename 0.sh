@@ -2688,6 +2688,96 @@ backup_menu(){
   done
 }
 
+current_timezone(){
+  local tz=""
+  if has_cmd timedatectl; then
+    tz="$(timedatectl show -p Timezone --value 2>/dev/null | head -n1 || true)"
+  fi
+  if [ -z "$tz" ] && [ -r /etc/timezone ]; then
+    tz="$(head -n1 /etc/timezone 2>/dev/null | tr -d '\r' || true)"
+  fi
+  if [ -z "$tz" ] && [ -L /etc/localtime ]; then
+    tz="$(readlink /etc/localtime 2>/dev/null || true)"
+    case "$tz" in
+      */zoneinfo/*) tz="${tz#*/zoneinfo/}" ;;
+    esac
+  fi
+  printf '%s' "$tz"
+}
+
+china_timezone_ok(){
+  local tz="$1" offset="$2"
+  [ "$tz" = "Asia/Shanghai" ] && [ "$offset" = "+0800" ]
+}
+
+set_china_timezone(){
+  if has_cmd timedatectl; then
+    timedatectl set-timezone Asia/Shanghai
+  else
+    [ -f /usr/share/zoneinfo/Asia/Shanghai ] || {
+      err "找不到 /usr/share/zoneinfo/Asia/Shanghai，请先安装 tzdata。"
+      return 1
+    }
+    ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+    echo "Asia/Shanghai" > /etc/timezone
+  fi
+}
+
+timezone_check_repair(){
+  local tz offset now china_now ntp_enabled ntp_synced epoch
+
+  clear 2>/dev/null || true
+  echo "============================================================"
+  echo " 时区检测修复"
+  echo "============================================================"
+
+  tz="$(current_timezone)"
+  offset="$(date +%z 2>/dev/null || echo unknown)"
+  now="$(date '+%Y-%m-%d %H:%M:%S %Z %z' 2>/dev/null || echo unknown)"
+  china_now="$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST +0800' 2>/dev/null || echo unknown)"
+
+  echo "当前系统时间：${now}"
+  echo "当前系统时区：${tz:-未知}"
+  echo "当前 UTC 偏移：${offset}"
+  echo "中国标准时间：${china_now}"
+
+  if china_timezone_ok "$tz" "$offset"; then
+    ok "当前时区已经是中国标准时间 Asia/Shanghai。"
+  else
+    warn "当前时区或 UTC 偏移不是中国标准时间 Asia/Shanghai / UTC+8。"
+    if confirm "是否切换系统时区到中国标准时间 Asia/Shanghai？" y; then
+      if set_china_timezone; then
+        ok "已切换到 Asia/Shanghai。"
+        echo "切换后时间：$(date '+%Y-%m-%d %H:%M:%S %Z %z' 2>/dev/null || echo unknown)"
+      else
+        err "时区切换失败。"
+      fi
+    else
+      warn "已保留当前时区。"
+    fi
+  fi
+
+  epoch="$(date +%s 2>/dev/null || echo 0)"
+  case "$epoch" in
+    ""|*[!0-9]*) epoch=0 ;;
+  esac
+  if [ "$epoch" -lt 1704067200 ]; then
+    warn "当前系统日期早于 2024-01-01，时间可能明显不准。"
+  fi
+
+  if has_cmd timedatectl; then
+    ntp_enabled="$(timedatectl show -p NTP --value 2>/dev/null || true)"
+    ntp_synced="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+    echo "NTP 自动校时：${ntp_enabled:-未知}"
+    echo "NTP 同步状态：${ntp_synced:-未知}"
+    if [ "$ntp_enabled" != "yes" ] && confirm "是否启用 NTP 自动校时？" y; then
+      timedatectl set-ntp true && ok "已启用 NTP 自动校时。" || warn "启用 NTP 自动校时失败。"
+    fi
+  fi
+
+  pause
+}
+
 main_menu(){
   need_root
   load_config
@@ -2699,28 +2789,31 @@ main_menu(){
     echo "============================================================"
     echo "1. 一键检测并切换APT软件源"
     echo "2. 一键检测并安装所有网络依赖"
-    echo "3. 一键开启SSH-ROOT用户登录"
-    echo "4. 一键查看当前网络配置"
-    echo "5. 本地网络路由管理"
-    echo "6. 4G网络管理 / IPV6 DDNS"
+    echo "3. 4G网络管理 / IPV6 DDNS"
+    echo "========="
+    echo "4. 一键开启SSH-ROOT用户登录"
+    echo "5. 一键查看当前网络配置"
+    echo "6. 本地网络路由管理"
     echo "7. 无线网络管理"
     echo "8. 重新加载 networkd / dnsmasq / nftables"
     echo "9. 一键扩容 rootfs"
     echo "10. 设置备份及恢复"
+    echo "11. 时区检测修复"
     echo "0. 退出"
     echo "============================================================"
     read -r -p "请选择：" choice
     case "$choice" in
       1) configure_apt_mirror ;;
       2) install_all_deps ;;
-      3) configure_ssh_root ;;
-      4) show_network ;;
-      5) local_network_router_menu ;;
-      6) lte4g_ddns_menu ;;
+      3) lte4g_ddns_menu ;;
+      4) configure_ssh_root ;;
+      5) show_network ;;
+      6) local_network_router_menu ;;
       7) wifi_menu ;;
       8) backup_now 重载 >/dev/null; reload_services; pause ;;
       9) expand_rootfs ;;
       10) backup_menu ;;
+      11) timezone_check_repair ;;
       0) exit 0 ;;
       *) warn "无效选择"; sleep 1 ;;
     esac
