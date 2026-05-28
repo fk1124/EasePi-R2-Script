@@ -1098,6 +1098,31 @@ repair_lxc_remount() {
     start_lxc_autostart_now
 }
 
+rebuild_openwrt_host_takeover() {
+    load_config
+
+    echo
+    echo "========== 重建 OpenWrt 宿主接管配置 =========="
+    if ! dir_has_entries "$CONTAINER_DIR"; then
+        warn "未发现已有容器目录：$CONTAINER_DIR"
+        return 1
+    fi
+
+    warn "此操作只重建 OpenWrt 网口接管、hostroute、容器自启动和快捷命令。"
+    warn "不会修改 /lxc 挂载、/etc/fstab、LXC 全局路径或 LXC 服务挂载顺序。"
+    confirm "确认继续重建宿主接管配置" y || { warn "已取消。"; return 0; }
+
+    repair_hostnet_from_existing_openwrt 0
+    save_config
+    repair_all_container_autostart
+    write_all_container_shortcuts
+
+    systemctl daemon-reload || true
+    ok "OpenWrt 宿主接管配置已重建。"
+    list_containers || true
+    start_lxc_autostart_now
+}
+
 lxc_dirs_menu() {
     local choice
     while true; do
@@ -1107,6 +1132,7 @@ lxc_dirs_menu() {
         echo "2. 修改 LXC 根目录"
         echo "3. 磁盘工具：检测 M.2/SSD 并挂载到 LXC 根目录"
         echo "4. 重挂载修复已有 LXC 数据"
+        echo "5. 重建 OpenWrt 宿主接管配置"
         echo "0. 返回"
         read -r -p "请选择: " choice || return 0
         case "$choice" in
@@ -1114,6 +1140,7 @@ lxc_dirs_menu() {
             2) set_lxc_dirs; pause_enter ;;
             3) mount_lxc_to_ssd; pause_enter ;;
             4) repair_lxc_remount; pause_enter ;;
+            5) rebuild_openwrt_host_takeover; pause_enter ;;
             0) return 0 ;;
             *) warn "无效选择。" ;;
         esac
@@ -2859,6 +2886,13 @@ restore_container() {
     repair_container_stable_macs "$name" || true
     write_container_shortcut "$name" || true
     ok "还原完成：$name"
+    if container_is_openwrt_router "$name"; then
+        if confirm "检测到 OpenWrt 路由容器，是否现在重建宿主接管配置？" y; then
+            rebuild_openwrt_host_takeover || true
+        else
+            warn "已跳过；如需恢复网口接管/hostroute/自启动，可稍后在“LXC 目录管理”执行。"
+        fi
+    fi
 }
 
 backup_git_askpass_script() {
