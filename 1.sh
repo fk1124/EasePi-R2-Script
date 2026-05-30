@@ -1719,6 +1719,10 @@ EOF
         if [ "$WAN_IF" != "none" ]; then
             cat <<'EOF'
 
+config device 'wan_dev'
+        option name 'wan'
+        option autoneg '1'
+
 config interface 'wan'
         option device 'wan'
         option proto 'dhcp'
@@ -1729,6 +1733,28 @@ config interface 'wan6'
 EOF
         fi
     } > "${rootfs_dir}/etc/config/network"
+
+    if [ "$WAN_IF" != "none" ]; then
+        mkdir -p "${rootfs_dir}/etc/hotplug.d/net"
+        cat > "${rootfs_dir}/etc/hotplug.d/net/10-wan-autoneg" <<'EOF'
+#!/bin/sh
+
+case "$ACTION" in
+    add|move|register|online) ;;
+    *) exit 0 ;;
+esac
+
+[ "$DEVICENAME" = "wan" ] || exit 0
+command -v ethtool >/dev/null 2>&1 || exit 0
+
+(
+    sleep 2
+    ethtool -s wan autoneg on >/dev/null 2>&1 || exit 0
+    logger -t wan-autoneg "enabled auto-negotiation on wan"
+) &
+EOF
+        chmod +x "${rootfs_dir}/etc/hotplug.d/net/10-wan-autoneg"
+    fi
 
     {
         cat <<'EOF'
