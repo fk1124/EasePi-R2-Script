@@ -38,6 +38,12 @@ LAN_CIDR="${LAN_CIDR:-10.10.0.0/24}"
 HOST_OPENWRT_ROUTE_ENABLE="${HOST_OPENWRT_ROUTE_ENABLE:-auto}"
 HOST_OPENWRT_ROUTE_METRIC="${HOST_OPENWRT_ROUTE_METRIC:-300}"
 HOST_OPENWRT_ROUTE_CHECK_IP="${HOST_OPENWRT_ROUTE_CHECK_IP:-223.5.5.5}"
+OPENWRT_NET_TUNE_ENABLE="${OPENWRT_NET_TUNE_ENABLE:-1}"
+OPENWRT_NET_TUNE_WAN_IRQ_CPU="${OPENWRT_NET_TUNE_WAN_IRQ_CPU:-6}"
+OPENWRT_NET_TUNE_LAN_IRQ_CPUS="${OPENWRT_NET_TUNE_LAN_IRQ_CPUS:-7 5 4}"
+OPENWRT_NET_TUNE_RPS_CPUS="${OPENWRT_NET_TUNE_RPS_CPUS:-f0}"
+OPENWRT_NET_TUNE_RPS_FLOW_CNT="${OPENWRT_NET_TUNE_RPS_FLOW_CNT:-4096}"
+OPENWRT_NET_TUNE_CPU_GOVERNOR="${OPENWRT_NET_TUNE_CPU_GOVERNOR:-performance}"
 DHCP_START_IP="${DHCP_START_IP:-10.10.0.100}"
 DHCP_END_IP="${DHCP_END_IP:-10.10.0.249}"
 CANDIDATE_IFS="${CANDIDATE_IFS:-eth0 eth1 eth2 eth3}"
@@ -231,6 +237,12 @@ load_config() {
     : "${HOST_OPENWRT_ROUTE_ENABLE:=auto}"
     : "${HOST_OPENWRT_ROUTE_METRIC:=300}"
     : "${HOST_OPENWRT_ROUTE_CHECK_IP:=223.5.5.5}"
+    : "${OPENWRT_NET_TUNE_ENABLE:=1}"
+    : "${OPENWRT_NET_TUNE_WAN_IRQ_CPU:=6}"
+    : "${OPENWRT_NET_TUNE_LAN_IRQ_CPUS:=7 5 4}"
+    : "${OPENWRT_NET_TUNE_RPS_CPUS:=f0}"
+    : "${OPENWRT_NET_TUNE_RPS_FLOW_CNT:=4096}"
+    : "${OPENWRT_NET_TUNE_CPU_GOVERNOR:=performance}"
     : "${DHCP_START_IP:=10.10.0.100}"
     : "${DHCP_END_IP:=10.10.0.249}"
 }
@@ -260,6 +272,12 @@ save_config() {
         printf 'HOST_OPENWRT_ROUTE_ENABLE=%q\n' "$HOST_OPENWRT_ROUTE_ENABLE"
         printf 'HOST_OPENWRT_ROUTE_METRIC=%q\n' "$HOST_OPENWRT_ROUTE_METRIC"
         printf 'HOST_OPENWRT_ROUTE_CHECK_IP=%q\n' "$HOST_OPENWRT_ROUTE_CHECK_IP"
+        printf 'OPENWRT_NET_TUNE_ENABLE=%q\n' "$OPENWRT_NET_TUNE_ENABLE"
+        printf 'OPENWRT_NET_TUNE_WAN_IRQ_CPU=%q\n' "$OPENWRT_NET_TUNE_WAN_IRQ_CPU"
+        printf 'OPENWRT_NET_TUNE_LAN_IRQ_CPUS=%q\n' "$OPENWRT_NET_TUNE_LAN_IRQ_CPUS"
+        printf 'OPENWRT_NET_TUNE_RPS_CPUS=%q\n' "$OPENWRT_NET_TUNE_RPS_CPUS"
+        printf 'OPENWRT_NET_TUNE_RPS_FLOW_CNT=%q\n' "$OPENWRT_NET_TUNE_RPS_FLOW_CNT"
+        printf 'OPENWRT_NET_TUNE_CPU_GOVERNOR=%q\n' "$OPENWRT_NET_TUNE_CPU_GOVERNOR"
         printf 'DHCP_START_IP=%q\n' "$DHCP_START_IP"
         printf 'DHCP_END_IP=%q\n' "$DHCP_END_IP"
     } > "$CONFIG_FILE"
@@ -344,7 +362,7 @@ install_lxc_dependencies() {
 }
 
 check_openwrt_kmods() {
-    local packages missing_packages modules ok_modules missing_modules mod
+    local packages missing_packages modules ok_modules missing_modules flow_modules ok_flow_modules missing_flow_modules mod
     packages=(
         kmod iproute2 iputils-ping ethtool bridge-utils
         iptables nftables ebtables arptables conntrack ipset
@@ -359,8 +377,11 @@ check_openwrt_kmods() {
         xt_TPROXY xt_socket xt_mark xt_connmark xt_conntrack xt_REDIRECT xt_MASQUERADE
         wireguard
     )
+    flow_modules=(nf_flow_table nft_flow_offload)
     ok_modules=()
     missing_modules=()
+    ok_flow_modules=()
+    missing_flow_modules=()
 
     echo
     echo "========== 检测 OpenWrt LXC 所需宿主内核能力 =========="
@@ -389,6 +410,14 @@ check_openwrt_kmods() {
         fi
     done
 
+    for mod in "${flow_modules[@]}"; do
+        if grep -qw "$mod" /proc/modules 2>/dev/null || modprobe -n "$mod" >/dev/null 2>&1; then
+            ok_flow_modules+=("$mod")
+        else
+            missing_flow_modules+=("$mod")
+        fi
+    done
+
     ensure_host_ppp_device
 
     mkdir -p /etc/modules-load.d
@@ -412,6 +441,12 @@ EOF
         warn "以下模块当前内核没有提供或名称不匹配："
         printf '  - %s\n' "${missing_modules[@]}"
         warn "这类模块不能靠脚本凭空安装；如果后续功能缺失，需要在 LiteHost 内核配置里开启。"
+    fi
+    if [ "${#ok_flow_modules[@]}" -gt 0 ]; then
+        ok "Flow offload 模块可用（仅检测，不会默认开启 OpenWrt firewall flow offload）：${ok_flow_modules[*]}"
+    fi
+    if [ "${#missing_flow_modules[@]}" -gt 0 ]; then
+        warn "Flow offload 可选模块未检测到：${missing_flow_modules[*]}"
     fi
 }
 
@@ -1612,6 +1647,345 @@ EOF
     systemctl enable easepi-r2-lxc-hostroute.timer >/dev/null 2>&1 || true
 }
 
+write_openwrt_net_tune_service() {
+    local name="$1"
+
+    case "$OPENWRT_NET_TUNE_ENABLE" in
+        0|off|OFF|no|NO|false|FALSE|disabled|DISABLED)
+            systemctl disable --now easepi-r2-lxc-openwrt-net-tune.service >/dev/null 2>&1 || true
+            warn "OpenWrt 网络性能调优已按配置禁用。"
+            return 0
+            ;;
+    esac
+
+    mkdir -p /etc/default
+    {
+        printf 'TUNE_ENABLE=%q\n' "$OPENWRT_NET_TUNE_ENABLE"
+        printf 'CT_NAME=%q\n' "$name"
+        printf 'CONTAINER_DIR=%q\n' "$CONTAINER_DIR"
+        printf 'WAN_IRQ_CPU=%q\n' "$OPENWRT_NET_TUNE_WAN_IRQ_CPU"
+        printf 'LAN_IRQ_CPUS=%q\n' "$OPENWRT_NET_TUNE_LAN_IRQ_CPUS"
+        printf 'RPS_CPUS=%q\n' "$OPENWRT_NET_TUNE_RPS_CPUS"
+        printf 'RPS_FLOW_CNT=%q\n' "$OPENWRT_NET_TUNE_RPS_FLOW_CNT"
+        printf 'CPU_GOVERNOR=%q\n' "$OPENWRT_NET_TUNE_CPU_GOVERNOR"
+    } > /etc/default/easepi-r2-lxc-openwrt-net-tune
+
+    cat > /usr/local/sbin/easepi-r2-lxc-openwrt-net-tune.sh <<'EOF'
+#!/bin/sh
+set -eu
+
+ENV_FILE="/etc/default/easepi-r2-lxc-openwrt-net-tune"
+[ -r "$ENV_FILE" ] && . "$ENV_FILE"
+
+: "${TUNE_ENABLE:=1}"
+: "${CT_NAME:?missing CT_NAME}"
+: "${CONTAINER_DIR:=/lxc/containers}"
+: "${WAN_IRQ_CPU:=6}"
+: "${LAN_IRQ_CPUS:=7 5 4}"
+: "${RPS_CPUS:=f0}"
+: "${RPS_FLOW_CNT:=4096}"
+: "${CPU_GOVERNOR:=performance}"
+
+LXC_CONFIG="${CONTAINER_DIR}/${CT_NAME}/config"
+
+log() { echo "[easepi-r2-openwrt-net-tune] $*"; }
+
+is_uint() {
+    case "${1:-}" in
+        ""|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+cpu_mask() {
+    local cpu="$1"
+
+    case "$cpu" in
+        0x*|0X*) printf '%s\n' "$cpu"; return 0 ;;
+    esac
+    is_uint "$cpu" || return 1
+    awk -v cpu="$cpu" 'BEGIN {
+        if (cpu < 0 || cpu > 63) exit 1
+        v = 1
+        for (i = 0; i < cpu; i++) v *= 2
+        printf "%x\n", v
+    }'
+}
+
+set_cpu_governor() {
+    local governor_file
+
+    [ -n "$CPU_GOVERNOR" ] || return 0
+    for governor_file in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do
+        [ -e "$governor_file" ] || continue
+        if [ -w "$governor_file" ]; then
+            printf '%s\n' "$CPU_GOVERNOR" > "$governor_file" 2>/dev/null || true
+        fi
+    done
+    log "CPU governor target: $CPU_GOVERNOR"
+}
+
+config_value() {
+    local key="$1"
+
+    [ -r "$LXC_CONFIG" ] || return 0
+    awk -F= -v want="$key" '
+    function trim(s) {
+        sub(/^[ \t\r\n]+/, "", s)
+        sub(/[ \t\r\n]+$/, "", s)
+        return s
+    }
+    {
+        k = trim($1)
+        if (k == want) {
+            v = $0
+            sub(/^[^=]*=/, "", v)
+            print trim(v)
+        }
+    }' "$LXC_CONFIG" | tail -n 1
+}
+
+phys_indexes() {
+    [ -r "$LXC_CONFIG" ] || return 0
+    awk -F= '
+    function trim(s) {
+        sub(/^[ \t\r\n]+/, "", s)
+        sub(/[ \t\r\n]+$/, "", s)
+        return s
+    }
+    {
+        k = trim($1)
+        v = trim($2)
+        if (k ~ /^lxc\.net\.[0-9]+\.type$/ && v == "phys") {
+            sub(/^lxc\.net\./, "", k)
+            sub(/\.type$/, "", k)
+            print k
+        }
+    }' "$LXC_CONFIG" | sort -n
+}
+
+find_irqs_for_labels() {
+    local label_a="$1"
+    local label_b="${2:-}"
+
+    awk -v a="$label_a" -v b="$label_b" '
+    function label_match(line, label, start, rel, pos, before, after) {
+        if (label == "") return 0
+        start = 1
+        while (start <= length(line)) {
+            rel = index(substr(line, start), label)
+            if (rel == 0) return 0
+            pos = start + rel - 1
+            before = (pos <= 1) ? " " : substr(line, pos - 1, 1)
+            after = substr(line, pos + length(label), 1)
+            if (before !~ /[[:alnum:]_]/ && after !~ /[[:alnum:]_]/) return 1
+            start = pos + 1
+        }
+        return 0
+    }
+    /^[[:space:]]*[0-9]+:/ {
+        irq = $1
+        sub(/:/, "", irq)
+        if (label_match($0, a) || label_match($0, b)) print irq
+    }' /proc/interrupts | sort -n -u
+}
+
+lan_cpu_for() {
+    local lan_no="$1"
+    local idx=1
+    local cpu
+    local last=""
+
+    is_uint "$lan_no" || lan_no=1
+    for cpu in $LAN_IRQ_CPUS; do
+        last="$cpu"
+        if [ "$idx" -eq "$lan_no" ]; then
+            printf '%s\n' "$cpu"
+            return 0
+        fi
+        idx=$((idx + 1))
+    done
+    if [ -n "$last" ]; then
+        printf '%s\n' "$last"
+    else
+        printf '%s\n' "$WAN_IRQ_CPU"
+    fi
+}
+
+set_irq_cpu() {
+    local irq="$1"
+    local cpu="$2"
+    local mask path
+
+    mask="$(cpu_mask "$cpu")" || {
+        log "skip IRQ $irq: invalid CPU target $cpu"
+        return 0
+    }
+    path="/proc/irq/${irq}/smp_affinity"
+    if [ ! -w "$path" ]; then
+        log "skip IRQ $irq: $path is not writable"
+        return 0
+    fi
+    if printf '%s\n' "$mask" > "$path" 2>/dev/null; then
+        log "IRQ $irq -> CPU $cpu (mask $mask)"
+    else
+        log "failed to write IRQ $irq affinity"
+    fi
+}
+
+tune_irqs() {
+    local idx ct_if host_if cpu lan_no irqs irq
+
+    if [ ! -r "$LXC_CONFIG" ]; then
+        log "skip IRQ tuning: missing LXC config $LXC_CONFIG"
+        return 0
+    fi
+
+    for idx in $(phys_indexes); do
+        ct_if="$(config_value "lxc.net.${idx}.name")"
+        host_if="$(config_value "lxc.net.${idx}.link")"
+        [ -n "$ct_if" ] || continue
+
+        case "$ct_if" in
+            wan)
+                cpu="$WAN_IRQ_CPU"
+                ;;
+            lan[0-9]*)
+                lan_no="${ct_if#lan}"
+                cpu="$(lan_cpu_for "$lan_no")"
+                ;;
+            *)
+                continue
+                ;;
+        esac
+
+        irqs="$(find_irqs_for_labels "$ct_if" "$host_if")"
+        if [ -z "$irqs" ]; then
+            log "no IRQ matched for $ct_if (${host_if:-unknown host iface})"
+            continue
+        fi
+        for irq in $irqs; do
+            set_irq_cpu "$irq" "$cpu"
+        done
+    done
+}
+
+wait_container_running() {
+    local i=0
+
+    while [ "$i" -lt 30 ]; do
+        if lxc-info -P "$CONTAINER_DIR" -n "$CT_NAME" -s 2>/dev/null | grep -q RUNNING; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 1
+    done
+    return 1
+}
+
+tune_container_rps() {
+    [ -n "$RPS_CPUS" ] || return 0
+    if ! command -v lxc-attach >/dev/null 2>&1; then
+        log "skip container RPS: lxc-attach is missing"
+        return 0
+    fi
+    if ! wait_container_running; then
+        log "skip container RPS: $CT_NAME is not running"
+        return 0
+    fi
+
+    if ! lxc-attach -P "$CONTAINER_DIR" -n "$CT_NAME" -- sh -s <<EOF_RPS
+RPS_CPUS="$RPS_CPUS"
+RPS_FLOW_CNT="$RPS_FLOW_CNT"
+
+log() { echo "[easepi-r2-openwrt-net-tune:ct] \$*"; }
+
+case "\$RPS_FLOW_CNT" in
+    ""|*[!0-9]*) RPS_FLOW_CNT=0 ;;
+esac
+
+if [ "\$RPS_FLOW_CNT" -gt 0 ] && [ -w /proc/sys/net/core/rps_sock_flow_entries ]; then
+    printf '%s\n' "\$RPS_FLOW_CNT" > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
+fi
+
+set_rps_dev() {
+    dev="\$1"
+    base="/sys/class/net/\$dev/queues"
+    changed=0
+    [ -d "\$base" ] || return 0
+
+    for rxq in "\$base"/rx-*; do
+        [ -d "\$rxq" ] || continue
+        if [ -w "\$rxq/rps_cpus" ]; then
+            printf '%s\n' "\$RPS_CPUS" > "\$rxq/rps_cpus" 2>/dev/null && changed=1 || true
+        else
+            log "skip \$dev \$(basename "\$rxq") rps_cpus: read-only"
+        fi
+
+        if [ "\$RPS_FLOW_CNT" -gt 0 ] && [ -w "\$rxq/rps_flow_cnt" ]; then
+            printf '%s\n' "\$RPS_FLOW_CNT" > "\$rxq/rps_flow_cnt" 2>/dev/null || true
+        fi
+    done
+
+    [ "\$changed" -eq 1 ] && log "RPS \$dev -> \$RPS_CPUS flow_cnt=\$RPS_FLOW_CNT"
+}
+
+for dev in br-lan pppoe-wan wan lan1 lan2 lan3 lan4 host0; do
+    set_rps_dev "\$dev"
+done
+EOF_RPS
+    then
+        log "container RPS tuning failed"
+    fi
+}
+
+detect_flow_offload_modules() {
+    local mod
+
+    for mod in nf_flow_table nft_flow_offload; do
+        if grep -qw "$mod" /proc/modules 2>/dev/null || { command -v modprobe >/dev/null 2>&1 && modprobe -n "$mod" >/dev/null 2>&1; }; then
+            log "flow offload module available: $mod (firewall offload is not enabled by this script)"
+        else
+            log "flow offload module not found: $mod"
+        fi
+    done
+}
+
+case "$TUNE_ENABLE" in
+    0|off|OFF|no|NO|false|FALSE|disabled|DISABLED)
+        log "disabled by TUNE_ENABLE=$TUNE_ENABLE"
+        exit 0
+        ;;
+esac
+
+detect_flow_offload_modules
+set_cpu_governor
+tune_irqs
+tune_container_rps
+log "done."
+EOF
+    chmod +x /usr/local/sbin/easepi-r2-lxc-openwrt-net-tune.sh
+
+    cat > /etc/systemd/system/easepi-r2-lxc-openwrt-net-tune.service <<'EOF'
+[Unit]
+Description=Tune EasePi-R2 OpenWrt LXC IRQ and RPS
+After=easepi-r2-lxc-hostnet.service lxc.service
+Wants=easepi-r2-lxc-hostnet.service lxc.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/easepi-r2-lxc-openwrt-net-tune
+ExecStart=/usr/local/sbin/easepi-r2-lxc-openwrt-net-tune.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable easepi-r2-lxc-openwrt-net-tune.service >/dev/null 2>&1 || true
+}
+
 write_openwrt_lxc_config() {
     local name="$1"
     local rootfs_dir="$2"
@@ -1976,6 +2350,11 @@ else
     echo "WARNING: OpenWrt cannot ping 223.5.5.5 yet."
 fi
 
+if [ -x /usr/local/sbin/easepi-r2-lxc-openwrt-net-tune.sh ]; then
+    echo "Apply OpenWrt network performance tuning..."
+    /usr/local/sbin/easepi-r2-lxc-openwrt-net-tune.sh || true
+fi
+
 /usr/local/sbin/easepi-r2-lxc-hostroute.sh || true
 
 curl -m 5 -sS -I "http://\$OPENWRT_IP/" 2>&1 | sed -n '1,8p' || true
@@ -2064,6 +2443,7 @@ install_openwrt_router() {
 
     write_hostnet_service
     write_hostroute_service
+    write_openwrt_net_tune_service "$name"
     write_openwrt_lxc_config "$name" "${dir}/rootfs" "$dir"
     configure_openwrt_rootfs "${dir}/rootfs"
     write_openwrt_finalizer "$name"
@@ -2186,6 +2566,83 @@ container_is_openwrt_router() {
     cfg="$(container_config_for "$name")"
     case "$name" in openwrt|openwrt[0-9]*|openwrt-*) return 0 ;; esac
     grep -Eq '^[[:space:]]*lxc\.net\.[0-9]+\.name[[:space:]]*=[[:space:]]*wan[[:space:]]*$' "$cfg" 2>/dev/null
+}
+
+choose_openwrt_router_container() {
+    local -a routers
+    local name choice idx
+
+    mapfile -t routers < <(
+        while read -r name; do
+            [ -n "$name" ] || continue
+            if container_is_openwrt_router "$name"; then
+                echo "$name"
+            fi
+        done < <(container_names)
+    )
+
+    if [ "${#routers[@]}" -eq 0 ]; then
+        warn "未发现 OpenWrt 路由容器。"
+        return 1
+    fi
+    if [ "${#routers[@]}" -eq 1 ]; then
+        echo "${routers[0]}"
+        return 0
+    fi
+
+    echo >&2
+    warn "检测到多个 OpenWrt 路由容器，请选择要应用网络性能优化的容器。"
+    idx=1
+    for name in "${routers[@]}"; do
+        printf '  %d. %s\n' "$idx" "$name" >&2
+        idx=$((idx + 1))
+    done
+    read -r -p "请选择 [1]: " choice || choice=1
+    choice="${choice:-1}"
+    case "$choice" in
+        *[!0-9]*|"")
+            warn "选择无效。"
+            return 1
+            ;;
+    esac
+    if [ "$choice" -lt 1 ] || [ "$choice" -gt "${#routers[@]}" ]; then
+        warn "选择超出范围。"
+        return 1
+    fi
+    echo "${routers[$((choice - 1))]}"
+}
+
+apply_openwrt_net_tune() {
+    local name
+
+    load_config
+    name="$(choose_openwrt_router_container)" || return 1
+
+    echo
+    echo "========== OpenWrt 网络性能优化 =========="
+    echo "容器名称       ：$name"
+    echo "WAN IRQ CPU    ：$OPENWRT_NET_TUNE_WAN_IRQ_CPU"
+    echo "LAN IRQ CPUs   ：$OPENWRT_NET_TUNE_LAN_IRQ_CPUS"
+    echo "RPS CPUs       ：$OPENWRT_NET_TUNE_RPS_CPUS"
+    echo "RPS flow cnt   ：$OPENWRT_NET_TUNE_RPS_FLOW_CNT"
+    echo "CPU governor   ：$OPENWRT_NET_TUNE_CPU_GOVERNOR"
+
+    write_openwrt_net_tune_service "$name"
+    save_config
+
+    case "$OPENWRT_NET_TUNE_ENABLE" in
+        0|off|OFF|no|NO|false|FALSE|disabled|DISABLED)
+            ok "已写入配置，但当前 OPENWRT_NET_TUNE_ENABLE=0，调优服务未启动。"
+            return 0
+            ;;
+    esac
+
+    if systemctl start easepi-r2-lxc-openwrt-net-tune.service >/dev/null 2>&1; then
+        ok "已安装并立即应用 OpenWrt 网络性能优化。"
+    else
+        warn "调优服务启动失败，可查看：journalctl -u easepi-r2-lxc-openwrt-net-tune.service -n 80 --no-pager"
+        return 1
+    fi
 }
 
 set_lxc_config_key() {
@@ -2349,12 +2806,19 @@ start_lxc_hostroute_if_present() {
     fi
 }
 
+start_openwrt_net_tune_if_present() {
+    if systemctl list-unit-files easepi-r2-lxc-openwrt-net-tune.service --no-legend 2>/dev/null | grep -q '^easepi-r2-lxc-openwrt-net-tune\.service'; then
+        systemctl start easepi-r2-lxc-openwrt-net-tune.service >/dev/null 2>&1 || true
+    fi
+}
+
 start_container_by_name() {
     local name="$1" i
     container_exists "$name" || die "容器不存在：$name"
     if container_running "$name"; then
         ok "$name 已在运行。"
         if container_is_openwrt_router "$name"; then
+            start_openwrt_net_tune_if_present
             start_lxc_hostroute_if_present
         fi
         return 0
@@ -2368,6 +2832,7 @@ start_container_by_name() {
         if container_running "$name"; then
             ok "$name 已启动。"
             if container_is_openwrt_router "$name"; then
+                start_openwrt_net_tune_if_present
                 start_lxc_hostroute_if_present
             fi
             return 0
@@ -2467,6 +2932,9 @@ router_guard() {
 
 start_ct() {
     if running; then
+        if [ "\$CT_ROUTER" = "1" ] && systemctl list-unit-files easepi-r2-lxc-openwrt-net-tune.service --no-legend 2>/dev/null | grep -q '^easepi-r2-lxc-openwrt-net-tune\.service'; then
+            systemctl start easepi-r2-lxc-openwrt-net-tune.service >/dev/null 2>&1 || true
+        fi
         if [ "\$CT_ROUTER" = "1" ] && systemctl list-unit-files easepi-r2-lxc-hostroute.service --no-legend 2>/dev/null | grep -q '^easepi-r2-lxc-hostroute\.service'; then
             systemctl start easepi-r2-lxc-hostroute.timer >/dev/null 2>&1 || true
             systemctl start easepi-r2-lxc-hostroute.service >/dev/null 2>&1 || true
@@ -2481,6 +2949,9 @@ start_ct() {
     i=0
     while [ "\$i" -lt 10 ]; do
         if running; then
+            if [ "\$CT_ROUTER" = "1" ] && systemctl list-unit-files easepi-r2-lxc-openwrt-net-tune.service --no-legend 2>/dev/null | grep -q '^easepi-r2-lxc-openwrt-net-tune\.service'; then
+                systemctl start easepi-r2-lxc-openwrt-net-tune.service >/dev/null 2>&1 || true
+            fi
             if [ "\$CT_ROUTER" = "1" ] && systemctl list-unit-files easepi-r2-lxc-hostroute.service --no-legend 2>/dev/null | grep -q '^easepi-r2-lxc-hostroute\.service'; then
                 systemctl start easepi-r2-lxc-hostroute.timer >/dev/null 2>&1 || true
                 systemctl start easepi-r2-lxc-hostroute.service >/dev/null 2>&1 || true
@@ -3644,6 +4115,7 @@ main_menu() {
         echo "11. 一键安装 Passwall（LXC 兼容，含中文翻译）"
         echo "12. 一键安装 EasyTier（LXC 兼容，含核心和中文翻译）"
         echo "13. LXC 容器管理"
+        echo "14. 应用 OpenWrt 网络性能优化"
         echo "s. 查看当前状态"
         echo "0. 退出"
         read -r -p "请选择: " choice || exit 0
@@ -3661,6 +4133,7 @@ main_menu() {
             11) install_openwrt_lxc_passwall; pause_enter ;;
             12) install_openwrt_lxc_easytier; pause_enter ;;
             13) container_manage_menu ;;
+            14) apply_openwrt_net_tune; pause_enter ;;
             s|S) show_status; pause_enter ;;
             0) exit 0 ;;
             *) warn "无效选择。" ;;
