@@ -1079,6 +1079,31 @@ ensure_host_ppp_device() {
     chmod 600 /dev/ppp 2>/dev/null || true
 }
 
+restore_lte4g_networkd_files() {
+    local disabled_dir="/etc/easepi-r2-lxc-manager/disabled-networkd"
+    local f base restored=0
+
+    [ -d "$disabled_dir" ] || return 0
+    mkdir -p /etc/systemd/network
+
+    for f in "$disabled_dir"/*lte4g* "$disabled_dir"/*lte-4g*; do
+        [ -e "$f" ] || continue
+        base="$(basename "$f")"
+        case "$base" in
+            *.link|*.network|*.netdev)
+                if [ ! -e "/etc/systemd/network/$base" ]; then
+                    mv "$f" "/etc/systemd/network/$base" 2>/dev/null || true
+                    restored=1
+                fi
+                ;;
+        esac
+    done
+
+    if [ "$restored" -eq 1 ]; then
+        ok "已恢复 lte4g 的 systemd-networkd 命名/网络规则。"
+    fi
+}
+
 ensure_openwrt_lxc_ppp_access() {
     local config_file="$1"
 
@@ -1128,6 +1153,7 @@ repair_lxc_remount() {
     persist_current_lxc_mount
     write_lxc_service_mount_dropin
     repair_hostnet_from_existing_openwrt 0
+    restore_lte4g_networkd_files
     repair_openwrt_ppp_access
     save_config
     repair_all_container_autostart
@@ -1156,6 +1182,7 @@ rebuild_openwrt_host_takeover() {
     confirm "确认继续重建宿主接管配置" y || { warn "已取消。"; return 0; }
 
     repair_hostnet_from_existing_openwrt 0
+    restore_lte4g_networkd_files
     repair_openwrt_ppp_access
     save_config
     repair_all_container_autostart
@@ -1342,6 +1369,27 @@ OPENWRT_IP="${OPENWRT_IP}"
 
 log() { echo "[easepi-r2-lxc-hostnet] \$*"; }
 
+restore_lte4g_networkd_files() {
+    local disabled_dir="/etc/easepi-r2-lxc-manager/disabled-networkd"
+    local f base
+
+    [ -d "\$disabled_dir" ] || return 0
+    mkdir -p /etc/systemd/network
+
+    for f in "\$disabled_dir"/*lte4g* "\$disabled_dir"/*lte-4g*; do
+        [ -e "\$f" ] || continue
+        base="\$(basename "\$f")"
+        case "\$base" in
+            *.link|*.network|*.netdev)
+                if [ ! -e "/etc/systemd/network/\$base" ]; then
+                    mv "\$f" "/etc/systemd/network/\$base" 2>/dev/null || true
+                    log "restore LTE networkd file: \$base"
+                fi
+                ;;
+        esac
+    done
+}
+
 log "stop host network services that may own OpenWrt NICs..."
 systemctl stop dnsmasq.service nftables.service NetworkManager.service NetworkManager-wait-online.service systemd-networkd.service lxc-net.service 2>/dev/null || true
 systemctl disable dnsmasq.service nftables.service NetworkManager.service NetworkManager-wait-online.service systemd-networkd.service lxc-net.service 2>/dev/null || true
@@ -1350,8 +1398,15 @@ if [ -d /etc/systemd/network ]; then
     mkdir -p /etc/easepi-r2-lxc-manager/disabled-networkd
     for f in /etc/systemd/network/*easepi-r2*.network /etc/systemd/network/*easepi-r2*.netdev /etc/systemd/network/*easepi-r2*.link /etc/systemd/network/*r2-br-lan* /etc/systemd/network/*r2-lan-*; do
         [ -e "\$f" ] || continue
-        mv "\$f" "/etc/easepi-r2-lxc-manager/disabled-networkd/\$(basename "\$f")" 2>/dev/null || true
+        base="\$(basename "\$f")"
+        case "\$base" in
+            *lte4g*|*lte-4g*)
+                continue
+                ;;
+        esac
+        mv "\$f" "/etc/easepi-r2-lxc-manager/disabled-networkd/\$base" 2>/dev/null || true
     done
+    restore_lte4g_networkd_files
 fi
 
 for mod in bridge br_netfilter veth tun overlay nf_tables nf_conntrack nf_nat nft_chain_nat nft_masq nft_redir x_tables ip_tables iptable_nat iptable_mangle xt_MASQUERADE xt_REDIRECT xt_conntrack; do
