@@ -351,6 +351,7 @@ check_openwrt_kmods() {
     )
     modules=(
         bridge br_netfilter veth tun overlay 8021q
+        slhc ppp_generic pppox pppoe
         nf_tables nf_conntrack nf_nat nft_chain_nat nft_masq nft_redir
         nft_tproxy nft_socket nf_tproxy_ipv4 nf_tproxy_ipv6
         nf_socket_ipv4 nf_socket_ipv6 ip_set ip_set_hash_ip ip_set_hash_net
@@ -387,6 +388,8 @@ check_openwrt_kmods() {
             missing_modules+=("$mod")
         fi
     done
+
+    ensure_host_ppp_device
 
     mkdir -p /etc/modules-load.d
     printf '%s\n' "${ok_modules[@]}" > /etc/modules-load.d/easepi-r2-lxc.conf
@@ -1067,6 +1070,45 @@ start_lxc_autostart_now() {
     list_containers || true
 }
 
+ensure_host_ppp_device() {
+    modprobe slhc 2>/dev/null || true
+    modprobe ppp_generic 2>/dev/null || true
+    modprobe pppox 2>/dev/null || true
+    modprobe pppoe 2>/dev/null || true
+    [ -e /dev/ppp ] || mknod /dev/ppp c 108 0 2>/dev/null || true
+    chmod 600 /dev/ppp 2>/dev/null || true
+}
+
+ensure_openwrt_lxc_ppp_access() {
+    local config_file="$1"
+
+    [ -f "$config_file" ] || return 0
+
+    grep -q '^lxc.cgroup.devices.allow = c 108:0 rwm$' "$config_file" || \
+        echo 'lxc.cgroup.devices.allow = c 108:0 rwm' >> "$config_file"
+    grep -q '^lxc.cgroup2.devices.allow = c 108:0 rwm$' "$config_file" || \
+        echo 'lxc.cgroup2.devices.allow = c 108:0 rwm' >> "$config_file"
+    grep -q '^lxc.mount.entry = /dev/ppp dev/ppp none bind,create=file,optional' "$config_file" || \
+        echo 'lxc.mount.entry = /dev/ppp dev/ppp none bind,create=file,optional' >> "$config_file"
+}
+
+repair_openwrt_ppp_access() {
+    local config_file changed=0
+
+    ensure_host_ppp_device
+
+    while IFS= read -r config_file; do
+        [ -f "$config_file" ] || continue
+        grep -Eq '^lxc\.net\.[0-9]+\.name = wan$' "$config_file" || continue
+        ensure_openwrt_lxc_ppp_access "$config_file"
+        changed=1
+    done < <(find "$CONTAINER_DIR" -mindepth 2 -maxdepth 2 -type f -name config 2>/dev/null)
+
+    if [ "$changed" -eq 1 ]; then
+        ok "已补齐 OpenWrt LXC PPPoE 所需 /dev/ppp 设备权限。"
+    fi
+}
+
 repair_lxc_remount() {
     load_config
 
@@ -1086,6 +1128,7 @@ repair_lxc_remount() {
     persist_current_lxc_mount
     write_lxc_service_mount_dropin
     repair_hostnet_from_existing_openwrt 0
+    repair_openwrt_ppp_access
     save_config
     repair_all_container_autostart
     write_all_container_shortcuts
@@ -1113,6 +1156,7 @@ rebuild_openwrt_host_takeover() {
     confirm "确认继续重建宿主接管配置" y || { warn "已取消。"; return 0; }
 
     repair_hostnet_from_existing_openwrt 0
+    repair_openwrt_ppp_access
     save_config
     repair_all_container_autostart
     write_all_container_shortcuts
@@ -1317,6 +1361,12 @@ done
 mkdir -p /dev/net
 [ -e /dev/net/tun ] || mknod /dev/net/tun c 10 200 2>/dev/null || true
 chmod 666 /dev/net/tun 2>/dev/null || true
+modprobe slhc 2>/dev/null || true
+modprobe ppp_generic 2>/dev/null || true
+modprobe pppox 2>/dev/null || true
+modprobe pppoe 2>/dev/null || true
+[ -e /dev/ppp ] || mknod /dev/ppp c 108 0 2>/dev/null || true
+chmod 600 /dev/ppp 2>/dev/null || true
 
 if [ "\$HOST_BR" != "br-lan" ] && ip link show br-lan >/dev/null 2>&1; then
     log "remove stale host br-lan..."
@@ -1515,6 +1565,8 @@ write_openwrt_lxc_config() {
     local lan_idx=1
     local iface
 
+    ensure_host_ppp_device
+
     cat > "${config_dir}/config" <<EOF
 lxc.rootfs.path = dir:${rootfs_dir}
 lxc.uts.name = ${name}
@@ -1529,7 +1581,10 @@ lxc.tty.max = 4
 lxc.pty.max = 1024
 lxc.cgroup.devices.allow = c 10:200 rwm
 lxc.cgroup2.devices.allow = c 10:200 rwm
+lxc.cgroup.devices.allow = c 108:0 rwm
+lxc.cgroup2.devices.allow = c 108:0 rwm
 lxc.mount.entry = /dev/net/tun dev/net/tun none bind,create=file,optional
+lxc.mount.entry = /dev/ppp dev/ppp none bind,create=file,optional
 lxc.mount.entry = /lib/modules lib/modules none ro,bind,optional,create=dir
 EOF
 
