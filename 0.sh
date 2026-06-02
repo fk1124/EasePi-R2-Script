@@ -1131,9 +1131,18 @@ IFACE="${1:-lte4g}"
 VID="${EASEPI_R2_ML307R_VID:-2ecc}"
 PID="${EASEPI_R2_ML307R_PID:-3012}"
 NEW_ID="/sys/bus/usb-serial/drivers/option1/new_id"
-APN="${EASEPI_R2_LTE4G_APN:-}"
+APN="${EASEPI_R2_LTE4G_APN:-ctnet}"
 AT_PORT=""
 LOG_TAG="easepi-r2-lte4g-manager"
+STATE_DIR="${EASEPI_R2_LTE4G_STATE_DIR:-/run/easepi-r2-lte4g}"
+FAIL_STATE="$STATE_DIR/${IFACE}.failures"
+FAILS_BEFORE_REDIAL="${EASEPI_R2_LTE4G_FAILS_BEFORE_REDIAL:-2}"
+PING_TIMEOUT="${EASEPI_R2_LTE4G_PING_TIMEOUT:-2}"
+HEALTH_IPV4_TARGETS="${EASEPI_R2_LTE4G_HEALTH_IPV4:-223.5.5.5 1.1.1.1}"
+HEALTH_IPV6_TARGETS="${EASEPI_R2_LTE4G_HEALTH_IPV6:-240c::6666 2606:4700:4700::1111}"
+HEALTH_WAIT_TRIES="${EASEPI_R2_LTE4G_HEALTH_WAIT_TRIES:-6}"
+HEALTH_WAIT_SLEEP="${EASEPI_R2_LTE4G_HEALTH_WAIT_SLEEP:-5}"
+FORCE_REDIAL="${EASEPI_R2_LTE4G_FORCE_REDIAL:-no}"
 
 log(){
   logger -t "$LOG_TAG" "$*" 2>/dev/null || true
@@ -1210,8 +1219,63 @@ wait_for_iface(){
   return 1
 }
 
+has_lte_addrs(){
+  ip -4 -o addr show dev "$IFACE" scope global 2>/dev/null | grep -q . || return 1
+  ip -6 -o addr show dev "$IFACE" scope global 2>/dev/null | grep -v ' tentative ' | grep -v ' deprecated ' | grep -q . || return 1
+}
+
+ping_targets(){
+  local family="$1" targets="$2" target flag=""
+  [ "$family" = 6 ] && flag="-6"
+  for target in $targets; do
+    if ping $flag -q -I "$IFACE" -c 1 -W "$PING_TIMEOUT" "$target" >/dev/null 2>&1; then
+      log "health $IFACE IPv$family OK via $target"
+      return 0
+    fi
+  done
+  log "health $IFACE IPv$family failed: $targets"
+  return 1
+}
+
+lte_healthy(){
+  has_lte_addrs || {
+    log "health $IFACE failed: missing usable IPv4 or IPv6 address"
+    return 2
+  }
+  ping_targets 4 "$HEALTH_IPV4_TARGETS" || return 1
+  ping_targets 6 "$HEALTH_IPV6_TARGETS" || return 1
+  return 0
+}
+
+wait_for_lte_health(){
+  local i
+  for i in $(seq 1 "$HEALTH_WAIT_TRIES"); do
+    if lte_healthy; then
+      return 0
+    fi
+    sleep "$HEALTH_WAIT_SLEEP"
+  done
+  return 1
+}
+
+reset_failures(){
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  rm -f "$FAIL_STATE" 2>/dev/null || true
+}
+
+mark_failure(){
+  local count=0
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  [ -r "$FAIL_STATE" ] && count="$(cat "$FAIL_STATE" 2>/dev/null || printf 0)"
+  case "$count" in *[!0-9]*|'') count=0 ;; esac
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$FAIL_STATE" 2>/dev/null || true
+  printf '%s\n' "$count"
+}
+
 configure_ml307r(){
   at_try ATE0 || true
+  at_try 'AT+CGACT=0,1' || true
   at_try AT+CGATT=1 || true
   if [ -n "$APN" ]; then
     at_try "AT+CGDCONT=1,\"IPV4V6\",\"$APN\"" || true
@@ -1223,6 +1287,14 @@ configure_ml307r(){
   at_try 'AT+MDIALUP=1,1' || true
 }
 
+refresh_lte_routes(){
+  sysctl -w "net.ipv6.conf.$IFACE.accept_ra=2" >/dev/null 2>&1 || true
+  sysctl -w "net.ipv6.conf.$IFACE.autoconf=1" >/dev/null 2>&1 || true
+  if [ -x /usr/local/sbin/easepi-r2-lte4g-policy-route.sh ]; then
+    /usr/local/sbin/easepi-r2-lte4g-policy-route.sh "$IFACE" 1004 1004 >/dev/null 2>&1 || true
+  fi
+}
+
 refresh_lte_network(){
   local i
   sysctl -w "net.ipv6.conf.$IFACE.accept_ra=2" >/dev/null 2>&1 || true
@@ -1232,19 +1304,15 @@ refresh_lte_network(){
   fi
   for i in $(seq 1 30); do
     ip -4 -o addr show dev "$IFACE" scope global >/dev/null 2>&1 && \
-      ip -6 -o addr show dev "$IFACE" scope global >/dev/null 2>&1 && break
+      ip -6 -o addr show dev "$IFACE" scope global 2>/dev/null | grep -v ' tentative ' | grep -q . && break
     sleep 1
   done
-  if [ -x /usr/local/sbin/easepi-r2-lte4g-policy-route.sh ]; then
-    /usr/local/sbin/easepi-r2-lte4g-policy-route.sh "$IFACE" 1004 1004 >/dev/null 2>&1 || true
-  fi
+  refresh_lte_routes
 }
 
-main(){
+redial_lte(){
   local stopped_mm=0
   bind_ml307r_at
-  wait_for_iface || log "$IFACE not found; skip LTE manager"
-
   AT_PORT="$(find_at_port 2>/dev/null || true)"
   if [ -z "$AT_PORT" ] && systemctl is-active --quiet ModemManager.service 2>/dev/null; then
     stopped_mm=1
@@ -1254,16 +1322,64 @@ main(){
   fi
 
   if [ -n "$AT_PORT" ]; then
-    log "using AT port $AT_PORT"
+    log "using AT port $AT_PORT, redial with APN $APN"
     configure_ml307r
   else
-    log "no ML307R AT port found; only refresh network routes"
+    log "no ML307R AT port found; only reconfigure network"
   fi
 
   refresh_lte_network
 
   if [ "$stopped_mm" -eq 1 ] && [ "${EASEPI_R2_LTE4G_RESTART_MODEMMANAGER:-no}" = yes ]; then
     systemctl start ModemManager.service >/dev/null 2>&1 || true
+  fi
+}
+
+main(){
+  local rc failures
+  wait_for_iface || { log "$IFACE not found; skip LTE manager"; exit 0; }
+
+  case "$FORCE_REDIAL" in
+    1|yes|true|force)
+      log "$IFACE force redial requested"
+      redial_lte
+      if wait_for_lte_health; then
+        reset_failures
+        log "$IFACE forced redial recovered"
+      else
+        log "$IFACE forced redial finished but health check still failed"
+      fi
+      exit 0
+      ;;
+  esac
+
+  lte_healthy
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    reset_failures
+    refresh_lte_routes
+    log "$IFACE healthy; skip AT redial"
+    exit 0
+  fi
+
+  if [ "$rc" -eq 2 ]; then
+    log "$IFACE has no complete address set; redial immediately"
+  else
+    failures="$(mark_failure)"
+    log "$IFACE health failure $failures/$FAILS_BEFORE_REDIAL"
+    if [ "$failures" -lt "$FAILS_BEFORE_REDIAL" ]; then
+      refresh_lte_routes
+      exit 0
+    fi
+  fi
+
+  redial_lte
+
+  if wait_for_lte_health; then
+    reset_failures
+    log "$IFACE redial recovered"
+  else
+    log "$IFACE redial finished but health check still failed"
   fi
 }
 
@@ -1279,8 +1395,13 @@ Wants=systemd-networkd.service
 
 [Service]
 Type=oneshot
+Environment="EASEPI_R2_LTE4G_APN=ctnet"
+Environment="EASEPI_R2_LTE4G_FAILS_BEFORE_REDIAL=2"
+Environment="EASEPI_R2_LTE4G_HEALTH_IPV4=223.5.5.5 1.1.1.1"
+Environment="EASEPI_R2_LTE4G_HEALTH_IPV6=240c::6666 2606:4700:4700::1111"
+Environment="EASEPI_R2_LTE4G_PING_TIMEOUT=2"
 ExecStart=$LTE_MANAGER_SCRIPT lte4g
-TimeoutStartSec=75
+TimeoutStartSec=150
 EOF_LTE_MANAGER_SERVICE
 
   cat > "$LTE_MANAGER_TIMER" <<'EOF_LTE_MANAGER_TIMER'
